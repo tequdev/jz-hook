@@ -600,6 +600,22 @@ export function stripStaticDataPrefix(sec) {
             }
           }
         }
+      } else if (child[0] === 'i64.const' &&
+        typeof child[1] === 'string' && (child[1].startsWith('0x') || child[1].startsWith('0X'))) {
+        // hook mode: NaN-boxed pointer emitted as i64.const 0x... — same shift logic
+        const bits = BigInt(child[1])
+        if (((bits >> 48n) & 0xFFF8n) === NAN_PREFIX) {
+          const ty = Number((bits >> TAG_SHIFT_BIG) & TAG_MASK_BIG)
+          if (SHIFTABLE.has(ty) &&
+              !(ty === PTR.STRING && ((bits >> AUX_SHIFT_BIG) & SSO_BIT_BIG))) {
+            const off = Number(bits & OFFSET_MASK_BIG)
+            if (off >= prefix) {
+              const hi = bits & ~OFFSET_MASK_BIG
+              const newBits = hi | BigInt(off - prefix)
+              child[1] = '0x' + newBits.toString(16).toUpperCase().padStart(16, '0')
+            }
+          }
+        }
       }
       shift(child)
     }

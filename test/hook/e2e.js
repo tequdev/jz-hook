@@ -72,15 +72,21 @@ test('hook/e2e: hook-accept returns NaN-boxed string tag=4 (STRING)', async () =
   equal(tag, 4, `expected STRING tag (4), got ${tag}`)
 })
 
-test('hook/e2e: hook-accept "OK" returns SSO string of length 2', async () => {
+test('hook/e2e: hook-accept "OK" returns heap string (SSO disabled in hook mode)', async () => {
   const instance = await hookInstance(`export let hook = () => "OK"`)
   const result = instance.exports.hook(0)
-  // aux bits 46-32: SSO bit (14) set → inline string, length in bits 2-0
+  // In hook mode SSO is disabled; "OK" is a heap string
+  // NaN-box layout: aux bits[46:32] should have SSO bit (0x4000) clear
   const aux = Number((result >> 32n) & 0x7FFFn)
   const isSSO = !!(aux & 0x4000)
-  const len = aux & 0x7
-  ok(isSSO, `expected SSO string, aux=${aux.toString(16)}`)
-  equal(len, 2, `expected length 2, got ${len}`)
+  ok(!isSSO, `expected heap string (no SSO), aux=${aux.toString(16)}`)
+  // ptr = low 32 bits; data layout: mem[ptr-4..ptr-1] = LE u32 length, mem[ptr..] = UTF-8 bytes
+  const ptr = Number(result & 0xFFFFFFFFn)
+  const mem = new Uint8Array(instance.exports.memory.buffer)
+  const len = mem[ptr-4] | (mem[ptr-3]<<8) | (mem[ptr-2]<<16) | (mem[ptr-1]<<24)
+  equal(len, 2, `expected length 2 at mem[ptr-4], got ${len}`)
+  equal(mem[ptr], 79, `expected 'O' (79) at mem[ptr], got ${mem[ptr]}`)
+  equal(mem[ptr+1], 75, `expected 'K' (75) at mem[ptr+1], got ${mem[ptr+1]}`)
 })
 
 // ---------------------------------------------------------------------------

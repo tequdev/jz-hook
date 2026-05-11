@@ -2,8 +2,8 @@
  * Hook API bindings — maps `import { fn } from 'hook'` to env.* WASM imports.
  * Registers all Xahau Hook API WASM imports and emitter table entries.
  */
-import { asI64, asI32, typed } from '../../src/ir.js'
-import { inc } from '../../src/ctx.js'
+import { asI64, asI32, typed, temp } from '../../src/ir.js'
+import { inc, ctx } from '../../src/ctx.js'
 import { emit } from '../../src/emit.js'
 
 export const HOOK_SCRATCH_OFFSET = 512
@@ -29,11 +29,7 @@ export const ensureHookImport = (ctx, name, params, result = 'i64') => {
 }
 
 export default (ctx) => {
-  // Ensure stdlib helpers used by hook API emitters land in the binary.
-  // hookStrPtr/hookStrLen/hookBufLen call $__ptr_offset, $__str_len, $__len directly;
-  // without inc() they'd be absent from sec.stdlib when the user source has no
-  // array/string operations that would otherwise trigger their inclusion.
-  inc('__ptr_offset', '__str_len', '__len')
+  // No stdlib inc needed — ptr/len extraction is fully inlined as bit ops below.
 
   // Sanity check: static data must not overflow into scratch area
   const dataLen = ctx.runtime?.data?.length ?? 0
@@ -136,12 +132,73 @@ export default (ctx) => {
   ensureHookImport(ctx, 'sto_emplace', ['i32', 'i32', 'i32', 'i32', 'i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'sto_erase', ['i32', 'i32', 'i32', 'i32', 'i32'])
 
-  // Helper: extract (ptr i32, len i32) from NaN-boxed string/buffer.
-  // Each helper calls emit(v) to resolve variable references and literal AST nodes
-  // to proper IR before coercing, avoiding bare-string identifiers in the output.
-  const hookStrPtr = (v) => typed(['call', '$__ptr_offset', asI64(emit(v))], 'i32')
-  const hookStrLen = (v) => typed(['call', '$__str_len', asI64(emit(v))], 'i32')
-  const hookBufLen = (v) => typed(['call', '$__len', asI64(emit(v))], 'i32')
+  // Compile-time helpers: extract (ptr i32, len i32) from NaN-boxed string/buffer
+  // without any runtime function calls.  SSO is disabled in hook mode so the low
+  // 32 bits of every string NaN-box are always a valid heap memory address.
+
+  // Read a LE i32 from the static data segment at byte index idx.
+  const readDataI32 = (idx) => {
+    const data = ctx.runtime.data
+    if (!data || idx < 0 || idx + 4 > data.length) return null
+    return (data.charCodeAt(idx) | (data.charCodeAt(idx+1)<<8) |
+            (data.charCodeAt(idx+2)<<16) | (data.charCodeAt(idx+3)<<24)) >>> 0
+  }
+
+  // Extract BigInt bits from an i64.const IR node.
+  const getI64Bits = (ir) => {
+    if (!Array.isArray(ir) || ir[0] !== 'i64.const') return null
+    const v = ir[1]
+    try { return typeof v === 'bigint' ? v : BigInt(v) } catch { return null }
+  }
+
+  // hookStrArgs(v) → [ptr_ir, len_ir]
+  // ptr = memory address of string bytes (low 32 bits of NaN-box, heap only — SSO disabled)
+  // len = UTF-8 byte count (compile-time from data pool header at ptr-4, or i32.load at runtime)
+  const hookStrArgs = (v) => {
+    const ir = asI64(emit(v))
+    const bits = getI64Bits(ir)
+    if (bits != null) {
+      const offset = Number(bits & 0xFFFFFFFFn)
+      const len = readDataI32(offset - 4)
+      if (len != null)
+        return [typed(['i32.const', offset], 'i32'), typed(['i32.const', len], 'i32')]
+    }
+    if (ir[0] === 'local.get' || ir[0] === 'global.get') {
+      return [
+        typed(['i32.wrap_i64', ir], 'i32'),
+        typed(['i32.load', ['i32.sub', ['i32.wrap_i64', ir], ['i32.const', 4]]], 'i32')
+      ]
+    }
+    const tmp = temp(); ctx.func.locals.set(tmp, 'i64')
+    return [
+      typed(['i32.wrap_i64', typed(['local.tee', `$${tmp}`, ir], 'i64')], 'i32'),
+      typed(['i32.load', ['i32.sub', ['i32.wrap_i64', typed(['local.get', `$${tmp}`], 'i64')], ['i32.const', 4]]], 'i32')
+    ]
+  }
+
+  // hookBufArgs(v) → [ptr_ir, len_ir]
+  // ptr = low 32 bits, len = mem[ptr-8] (Buffer/Array/Uint8Array header: [-8:len][-4:cap][data])
+  const hookBufArgs = (v) => {
+    const ir = asI64(emit(v))
+    const bits = getI64Bits(ir)
+    if (bits != null) {
+      const offset = Number(bits & 0xFFFFFFFFn)
+      const len = readDataI32(offset - 8)
+      if (len != null)
+        return [typed(['i32.const', offset], 'i32'), typed(['i32.const', len], 'i32')]
+    }
+    if (ir[0] === 'local.get' || ir[0] === 'global.get') {
+      return [
+        typed(['i32.wrap_i64', ir], 'i32'),
+        typed(['i32.load', ['i32.sub', ['i32.wrap_i64', ir], ['i32.const', 8]]], 'i32')
+      ]
+    }
+    const tmp = temp(); ctx.func.locals.set(tmp, 'i64')
+    return [
+      typed(['i32.wrap_i64', typed(['local.tee', `$${tmp}`, ir], 'i64')], 'i32'),
+      typed(['i32.load', ['i32.sub', ['i32.wrap_i64', typed(['local.get', `$${tmp}`], 'i64')], ['i32.const', 8]]], 'i32')
+    ]
+  }
 
   // === Emitters for zero-arg functions (return i64) ===
   for (const fn0 of ['otxn_type', 'otxn_burden', 'etxn_burden', 'hook_pos', 'hook_again',
@@ -232,60 +289,42 @@ export default (ctx) => {
 
   // accept(msg, code) → accept(msg_ptr, msg_len, code_i64)
   ctx.core.emit['hook.accept'] = (msg, code) =>
-    typed(['call', '$hook_accept',
-      hookStrPtr(msg), hookStrLen(msg),
-      e64(code)], 'i64')
+    typed(['call', '$hook_accept', ...hookStrArgs(msg), e64(code)], 'i64')
 
   // rollback(msg, code) → rollback(msg_ptr, msg_len, code_i64)
   ctx.core.emit['hook.rollback'] = (msg, code) =>
-    typed(['call', '$hook_rollback',
-      hookStrPtr(msg), hookStrLen(msg),
-      e64(code)], 'i64')
+    typed(['call', '$hook_rollback', ...hookStrArgs(msg), e64(code)], 'i64')
 
   // trace(label, data, ashex)
   ctx.core.emit['hook.trace'] = (label, data, ashex) =>
     typed(['call', '$hook_trace',
-      hookStrPtr(label), hookStrLen(label),
-      hookStrPtr(data), hookBufLen(data),
+      ...hookStrArgs(label), ...hookBufArgs(data),
       eopt32(ashex, ['i32.const', 0])], 'i64')
 
   // trace_num(label, num)
   ctx.core.emit['hook.trace_num'] = (label, num) =>
-    typed(['call', '$hook_trace_num',
-      hookStrPtr(label), hookStrLen(label),
-      e64(num)], 'i64')
+    typed(['call', '$hook_trace_num', ...hookStrArgs(label), e64(num)], 'i64')
 
   // trace_float(label, xfl)
   ctx.core.emit['hook.trace_float'] = (label, xfl) =>
-    typed(['call', '$hook_trace_float',
-      hookStrPtr(label), hookStrLen(label),
-      e64(xfl)], 'i64')
+    typed(['call', '$hook_trace_float', ...hookStrArgs(label), e64(xfl)], 'i64')
 
   // state(out_buf, key) → state(wptr, wlen, kptr, klen)
   ctx.core.emit['hook.state'] = (out, key) =>
-    typed(['call', '$hook_state',
-      hookStrPtr(out), hookBufLen(out),
-      hookStrPtr(key), hookStrLen(key)], 'i64')
+    typed(['call', '$hook_state', ...hookBufArgs(out), ...hookStrArgs(key)], 'i64')
 
   // state_set(val_buf, key)
   ctx.core.emit['hook.state_set'] = (val, key) =>
-    typed(['call', '$hook_state_set',
-      hookStrPtr(val), hookBufLen(val),
-      hookStrPtr(key), hookStrLen(key)], 'i64')
+    typed(['call', '$hook_state_set', ...hookBufArgs(val), ...hookStrArgs(key)], 'i64')
 
   // otxn_field(sfField) → scratch; otxn_field(buf, sfField) → user buffer
   ctx.core.emit['hook.otxn_field'] = (arg0, arg1) => {
     if (arg1 == null) {
-      // 1-arg: write to scratch buffer
       return typed(['call', '$hook_otxn_field',
-        ['i32.const', HOOK_SCRATCH_OFFSET],
-        ['i32.const', HOOK_SCRATCH_SIZE],
+        ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE],
         e32(arg0)], 'i64')
     }
-    // 2-arg: write to user-provided buffer
-    return typed(['call', '$hook_otxn_field',
-      hookStrPtr(arg0), hookBufLen(arg0),
-      e32(arg1)], 'i64')
+    return typed(['call', '$hook_otxn_field', ...hookBufArgs(arg0), e32(arg1)], 'i64')
   }
 
   // hook_account() → scratch; hook_account(out_buf) → user buffer
@@ -339,16 +378,16 @@ export default (ctx) => {
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE],
         e32(arg0)], 'i64')
     }
-    return typed(['call', '$hook_slot', hookStrPtr(arg0), hookBufLen(arg0), e32(arg1)], 'i64')
+    return typed(['call', '$hook_slot', ...hookBufArgs(arg0), e32(arg1)], 'i64')
   }
 
   // slot_id(out_buf, slot_no)
   ctx.core.emit['hook.slot_id'] = (out, slotNo) =>
-    typed(['call', '$hook_slot_id', hookStrPtr(out), hookBufLen(out), e32(slotNo)], 'i64')
+    typed(['call', '$hook_slot_id', ...hookBufArgs(out), e32(slotNo)], 'i64')
 
   // slot_set(buf, slot_no)
   ctx.core.emit['hook.slot_set'] = (buf, slotNo) =>
-    typed(['call', '$hook_slot_set', hookStrPtr(buf), hookBufLen(buf), e32(slotNo)], 'i64')
+    typed(['call', '$hook_slot_set', ...hookBufArgs(buf), e32(slotNo)], 'i64')
 
   // slot_subfield(parent, field_id, new_slot)
   ctx.core.emit['hook.slot_subfield'] = (parent, fid, newSlot) =>
@@ -366,39 +405,30 @@ export default (ctx) => {
   // util_keylet(out, type, a, b, c, d, e, f)
   ctx.core.emit['hook.util_keylet'] = (out, type, a, b, c, d, ef, ff) =>
     typed(['call', '$hook_util_keylet',
-      hookStrPtr(out), hookBufLen(out),
-      e32(type),
-      eopt32(a, ['i32.const', 0]),
-      eopt32(b, ['i32.const', 0]),
-      eopt32(c, ['i32.const', 0]),
-      eopt32(d, ['i32.const', 0]),
-      eopt32(ef, ['i32.const', 0]),
-      eopt32(ff, ['i32.const', 0])], 'i64')
+      ...hookBufArgs(out), e32(type),
+      eopt32(a, ['i32.const', 0]), eopt32(b, ['i32.const', 0]),
+      eopt32(c, ['i32.const', 0]), eopt32(d, ['i32.const', 0]),
+      eopt32(ef, ['i32.const', 0]), eopt32(ff, ['i32.const', 0])], 'i64')
 
   // util_sha512h(out, input)
   ctx.core.emit['hook.util_sha512h'] = (out, input) =>
     typed(['call', '$hook_util_sha512h',
-      hookStrPtr(out), hookBufLen(out),
-      hookStrPtr(input), hookBufLen(input)], 'i64')
+      ...hookBufArgs(out), ...hookBufArgs(input)], 'i64')
 
   // util_accid(out, raddr_str)
   ctx.core.emit['hook.util_accid'] = (out, raddr) =>
     typed(['call', '$hook_util_accid',
-      hookStrPtr(out), hookBufLen(out),
-      hookStrPtr(raddr), hookStrLen(raddr)], 'i64')
+      ...hookBufArgs(out), ...hookStrArgs(raddr)], 'i64')
 
   // util_raddr(out, accid_buf)
   ctx.core.emit['hook.util_raddr'] = (out, accid) =>
     typed(['call', '$hook_util_raddr',
-      hookStrPtr(out), hookBufLen(out),
-      hookStrPtr(accid), hookBufLen(accid)], 'i64')
+      ...hookBufArgs(out), ...hookBufArgs(accid)], 'i64')
 
   // util_verify(sig, data, pubkey)
   ctx.core.emit['hook.util_verify'] = (sig, data, pubkey) =>
     typed(['call', '$hook_util_verify',
-      hookStrPtr(sig), hookBufLen(sig),
-      hookStrPtr(data), hookBufLen(data),
-      hookStrPtr(pubkey), hookBufLen(pubkey)], 'i64')
+      ...hookBufArgs(sig), ...hookBufArgs(data), ...hookBufArgs(pubkey)], 'i64')
 
   // util_encode(write_ptr, write_len, read_ptr, read_len, type) → i64
   ctx.core.emit['hook.util_encode'] = (...args) =>
@@ -410,25 +440,23 @@ export default (ctx) => {
 
   // emit(out_buf, tx_buf)
   ctx.core.emit['hook.emit'] = (out, tx) =>
-    typed(['call', '$hook_emit',
-      hookStrPtr(out), hookBufLen(out),
-      hookStrPtr(tx), hookBufLen(tx)], 'i64')
+    typed(['call', '$hook_emit', ...hookBufArgs(out), ...hookBufArgs(tx)], 'i64')
 
   // etxn_details(out_buf)
   ctx.core.emit['hook.etxn_details'] = (out) =>
-    typed(['call', '$hook_etxn_details', hookStrPtr(out), hookBufLen(out)], 'i64')
+    typed(['call', '$hook_etxn_details', ...hookBufArgs(out)], 'i64')
 
   // sto_subfield(buf, field_id)
   ctx.core.emit['hook.sto_subfield'] = (buf, fid) =>
-    typed(['call', '$hook_sto_subfield', hookStrPtr(buf), hookBufLen(buf), e32(fid)], 'i64')
+    typed(['call', '$hook_sto_subfield', ...hookBufArgs(buf), e32(fid)], 'i64')
 
   // sto_subarray(buf, array_id)
   ctx.core.emit['hook.sto_subarray'] = (buf, aid) =>
-    typed(['call', '$hook_sto_subarray', hookStrPtr(buf), hookBufLen(buf), e32(aid)], 'i64')
+    typed(['call', '$hook_sto_subarray', ...hookBufArgs(buf), e32(aid)], 'i64')
 
   // sto_validate(buf)
   ctx.core.emit['hook.sto_validate'] = (buf) =>
-    typed(['call', '$hook_sto_validate', hookStrPtr(buf), hookBufLen(buf)], 'i64')
+    typed(['call', '$hook_sto_validate', ...hookBufArgs(buf)], 'i64')
 
   // sto_emplace(write_ptr, write_len, sread_ptr, sread_len, fread_ptr, fread_len, field_id) → i64
   ctx.core.emit['hook.sto_emplace'] = (...args) =>
@@ -441,18 +469,14 @@ export default (ctx) => {
   // state_foreign(out, key, ns, acc)
   ctx.core.emit['hook.state_foreign'] = (out, key, ns, acc) =>
     typed(['call', '$hook_state_foreign',
-      hookStrPtr(out), hookBufLen(out),
-      hookStrPtr(key), hookStrLen(key),
-      hookStrPtr(ns), hookBufLen(ns),
-      hookStrPtr(acc), hookBufLen(acc)], 'i64')
+      ...hookBufArgs(out), ...hookStrArgs(key),
+      ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
 
   // state_foreign_set(val, key, ns, acc)
   ctx.core.emit['hook.state_foreign_set'] = (val, key, ns, acc) =>
     typed(['call', '$hook_state_foreign_set',
-      hookStrPtr(val), hookBufLen(val),
-      hookStrPtr(key), hookStrLen(key),
-      hookStrPtr(ns), hookBufLen(ns),
-      hookStrPtr(acc), hookBufLen(acc)], 'i64')
+      ...hookBufArgs(val), ...hookStrArgs(key),
+      ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
 
   // === Scratch buffer emitters (Change 4) ===
   ctx.core.emit['hook.SCRATCH_PTR'] = () => typed(['i32.const', HOOK_SCRATCH_OFFSET], 'i32')

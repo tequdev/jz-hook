@@ -906,14 +906,14 @@ export const emitter = {
     if (ctx.transform.host === 'hook') {
       // In hook mode, lower throw → rollback(msg_ptr, msg_len, 0i64).
       // $hook_rollback is imported by module/hook/api.js with signature (i32 i32 i64) → i64.
-      inc('__ptr_offset', '__str_len')
+      // SSO is disabled in hook mode, so low 32 bits of NaN-box = memory ptr, len at ptr-4.
       const thrown = temp()
       ctx.func.locals.set(thrown, 'i64')
       return typed(['block',
         ['local.set', `$${thrown}`, asI64(emit(expr))],
         ['drop', ['call', '$hook_rollback',
-          ['call', '$__ptr_offset', typed(['local.get', `$${thrown}`], 'i64')],
-          ['call', '$__str_len', typed(['local.get', `$${thrown}`], 'i64')],
+          typed(['i32.wrap_i64', typed(['local.get', `$${thrown}`], 'i64')], 'i32'),
+          typed(['i32.load', ['i32.sub', ['i32.wrap_i64', typed(['local.get', `$${thrown}`], 'i64')], ['i32.const', 4]]], 'i32'),
           ['i64.const', 0]]],
         ['unreachable']], 'void')
     }

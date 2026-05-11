@@ -213,6 +213,7 @@ jz.compile = (code, opts = {}) => {
       ctx.transform.alloc = false
       ctx.transform.noTailCall = true
       ctx.features.hook = true
+      ctx.features.sso = false  // SSO offsets are packed chars, not memory addrs — invalid for Hook API
       if (opts.hookOn !== undefined) ctx.transform.hookOn = BigInt(opts.hookOn)
       if (opts.namespace) ctx.transform.hookNamespace = opts.namespace
       if (opts.maxIter !== undefined) ctx.transform.hookMaxIter = Number(opts.maxIter)
