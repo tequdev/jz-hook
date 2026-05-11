@@ -23,7 +23,8 @@ import { ctx } from './ctx.js'
  */
 export function insertGuards(sec) {
   let id = 0
-  const maxIter = ctx.transform.hookMaxIter ?? 65535
+  const defaultMax = ctx.transform.hookMaxIter ?? 65535
+  const hints = ctx.runtime.hookLoopHints  // Map<loopLabel, maxIter> from emit phase
 
   const guardFns = [
     ...(sec.funcs || []),
@@ -40,6 +41,8 @@ export function insertGuards(sec) {
       id++
       // Determine where the body starts: after optional label string at index 1
       const bodyStart = (typeof node[1] === 'string') ? 2 : 1
+      const label = typeof node[1] === 'string' ? node[1] : null
+      const maxIter = (label && hints?.get(label)) ?? defaultMax
       const guardCall = ['drop', ['call', '$hook__g', ['i32.const', id], ['i32.const', maxIter]]]
       node.splice(bodyStart, 0, guardCall)
       // Recurse into children starting after the guard we just inserted

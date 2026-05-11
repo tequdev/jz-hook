@@ -834,6 +834,16 @@ function compoundAssign(name, val, f64op, i32op) {
   return writeVar(name, f64op(asF64(va), asF64(vb)), void_)
 }
 
+/** Infer a static loop guard max-iter count from a for-loop condition AST node.
+ *  Returns N for `i < N` or `i <= N` with a literal bound; null otherwise. */
+function inferGuardMaxIter(cond) {
+  if (!Array.isArray(cond)) return null
+  const [op, , right] = cond
+  if (op === '<') { const n = nonNegIntLiteral(right); return n != null && n > 0 ? n : null }
+  if (op === '<=') { const n = nonNegIntLiteral(right); return n != null ? n + 1 : null }
+  return null
+}
+
 /**
  * Core emitter table. Maps AST ops to WASM IR generators.
  * ctx.core.emit is seeded with a flat copy of this object on reset;
@@ -1765,6 +1775,10 @@ export const emitter = {
     else loopBody.push(...emitFlat(body))
     if (step) loopBody.push(...emitFlat(step))
     loopBody.push(['br', loop])
+    if (ctx.transform.host === 'hook' && cond) {
+      const hint = inferGuardMaxIter(cond)
+      if (hint != null) (ctx.runtime.hookLoopHints ??= new Map()).set(loop, hint)
+    }
     result.push(['block', brk, ['loop', loop, ...loopBody]])
     ctx.func.stack.pop()
     return result.length === 1 ? result[0] : result

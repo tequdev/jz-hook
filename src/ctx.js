@@ -199,6 +199,7 @@ export function reset(proto, globals) {
     strPool: null,         // shared-memory: accumulated raw bytes of string literals (no length prefix)
     strPoolDedup: new Map(),  // str → offset in strPool
     throws: false,
+    hookLoopHints: null,  // Map<loopLabel, maxIter> — set by emit.js for static for-loop bounds
   }
 
   ctx.memory = {
