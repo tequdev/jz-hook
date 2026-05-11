@@ -3,7 +3,7 @@
  * Usage: import { sfAccount, sfDestination, KEYLET_ACCOUNT } from 'hook'
  * Each constant is lowered to an i32.const at compile time.
  */
-import { asI32 } from '../../src/ir.js'
+import { asI32, typed } from '../../src/ir.js'
 
 export const SF_CODES = {
   sfInvalid: -1,
@@ -97,12 +97,12 @@ export const KEYLET_TYPES = {
 export default (ctx) => {
   // Register all sfcodes as compile-time i32 constants
   for (const [name, val] of Object.entries(SF_CODES)) {
-    ctx.core.emit[`hook.${name}`] = () => ['i32.const', val]
+    ctx.core.emit[`hook.${name}`] = () => typed(['i32.const', val], 'i32')
   }
 
   // Register keylet type constants
   for (const [name, val] of Object.entries(KEYLET_TYPES)) {
-    ctx.core.emit[`hook.${name}`] = () => ['i32.const', val]
+    ctx.core.emit[`hook.${name}`] = () => typed(['i32.const', val], 'i32')
   }
 
   // High-level keylet helpers: keylet_*(out_buf_ptr, arg1_ptr[, arg2_ptr])

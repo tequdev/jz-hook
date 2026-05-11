@@ -764,7 +764,12 @@ function prepDecl(op, ...inits) {
       // Module-scope variable → WASM global (mark as user-declared)
       if (depth === 0 && typeof declName === 'string') {
         if (ctx.scope.globals.has(declName)) err(`'${declName}' conflicts with a compiler internal — choose a different name`)
-        ctx.scope.globals.set(declName, `(global $${declName} (mut f64) (f64.const 0))`)
+        if (ctx.transform.host === 'hook') {
+          ctx.scope.globals.set(declName, `(global $${declName} (mut i64) (i64.const 0))`)
+          ctx.scope.globalTypes.set(declName, 'i64')
+        } else {
+          ctx.scope.globals.set(declName, `(global $${declName} (mut f64) (f64.const 0))`)
+        }
         ctx.scope.userGlobals.add(declName)
       }
       rest.push(['=', declName, normed])
@@ -1081,7 +1086,10 @@ const handlers = {
         if (defFunc('default', prep(val))) return null
       }
       // export default expr → create global 'default'
-      ctx.scope.globals.set('default', `(global $default (mut f64) (f64.const 0))`)
+      ctx.scope.globals.set('default', ctx.transform.host === 'hook'
+        ? `(global $default (mut i64) (i64.const 0))`
+        : `(global $default (mut f64) (f64.const 0))`)
+      if (ctx.transform.host === 'hook') ctx.scope.globalTypes.set('default', 'i64')
       ctx.scope.userGlobals.add('default')
       return ['=', 'default', prep(val)]
     }

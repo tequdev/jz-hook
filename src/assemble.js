@@ -501,24 +501,43 @@ export function buildHookExportFns(sec) {
         sec.customs.splice(i, 1)
     }
 
-    // Determine which inner function to call: prefer the boundary wrapper
-    // ($hook$exp / $cbak$exp) if it exists, since it re-boxes narrowed results
-    // back to f64. Fall back to the raw function otherwise.
-    const hasBoundaryWrap = sec.funcs.some(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === boundaryWrapName)
-    const callTarget = hasBoundaryWrap ? boundaryWrapName : innerName
+    // In hook mode, always call the inner function directly — the boundary wrapper
+    // ($hook$exp) re-boxes to f64 which is wrong when the inner function returns i64.
+    const callTarget = innerName
 
     // Only emit the wrapper if the inner function actually exists.
     const innerExists = sec.funcs.some(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === innerName)
     if (!innerExists) continue
 
     // Wrapper: (param $reserved i32) (result i64)
-    //   body: i64.reinterpret_f64 (call $<target>)
+    //   body: (call $<target> [args]) — skip reinterpret if target already returns i64
+    const callTargetFunc = sec.funcs.find(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === callTarget)
+    const callTargetReturnsI64 = callTargetFunc && callTargetFunc.some(n => Array.isArray(n) && n[0] === 'result' && n[1] === 'i64')
+    const callTargetReturnsI32 = callTargetFunc && callTargetFunc.some(n => Array.isArray(n) && n[0] === 'result' && n[1] === 'i32')
+    // Pass $reserved to the inner function's params (first param gets $reserved, extras get i64 undef)
+    const callTargetParams = callTargetFunc
+      ? callTargetFunc.filter(n => Array.isArray(n) && n[0] === 'param')
+      : []
+    const args = callTargetParams.map((p, idx) => {
+      const paramType = p[2]
+      if (idx === 0) {
+        if (paramType === 'i64') return ['i64.extend_i32_s', ['local.get', '$reserved']]
+        if (paramType === 'i32') return ['local.get', '$reserved']
+        return ['f64.convert_i32_s', ['local.get', '$reserved']]
+      }
+      return ['i64.const', '0x7FF9000000000000']  // extra params: NaN-boxed undefined
+    })
+    const callExpr = callTargetReturnsI64
+      ? ['call', callTarget, ...args]
+      : callTargetReturnsI32
+        ? ['i64.extend_i32_s', ['call', callTarget, ...args]]
+        : ['i64.reinterpret_f64', ['call', callTarget, ...args]]
     sec.funcs.push([
       'func', wrapperName,
       ['export', `"${name}"`],
       ['param', '$reserved', 'i32'],
       ['result', 'i64'],
-      ['i64.reinterpret_f64', ['call', callTarget]],
+      callExpr,
     ])
   }
 }

@@ -387,6 +387,8 @@ function synthesizeBoundaryWrappers() {
   for (const func of ctx.func.list) {
     if (!isBoundaryWrapped(func)) continue
     const { name, sig } = func
+    // In hook mode, hook/cbak wrappers are handled by buildHookExportFns — skip here.
+    if (ctx.transform.host === 'hook' && (name === 'hook' || name === 'cbak')) continue
     // Per-position i64 carrier: only swap to i64 where a NaN-boxed pointer
     // actually crosses the boundary (param.ptrKind set, or result with
     // sig.ptrKind set). Numeric narrowing (i32 trunc-sat / convert) keeps f64
@@ -690,9 +692,11 @@ export default function compile(ast, profiler) {
   }
 
   // Check user globals don't conflict with runtime globals (modules loaded after user decls)
-  for (const name of ctx.scope.userGlobals)
-    if (!ctx.scope.globals.get(name)?.includes('mut f64'))
+  for (const name of ctx.scope.userGlobals) {
+    const decl = ctx.scope.globals.get(name)
+    if (!decl?.includes('mut f64') && !decl?.includes('mut i64'))
       err(`'${name}' conflicts with a compiler internal — choose a different name`)
+  }
 
   // Pre-fold const globals: evaluate constant initializers before function compilation
   // so functions see the correct global types (i32 vs f64).
@@ -738,6 +742,16 @@ export default function compile(ast, profiler) {
 
   const programFacts = timePhase(profiler, 'plan', () => plan(ast))
 
+  // Hook: promote f64→i64 BEFORE analysis so analyzeLocals/analyzeIntCertain see
+  // correct param types — prevents f64 widening cascade in loops that compare i32
+  // locals against an i64 parameter (e.g. `for (let i = 0; i < n; i++)`).
+  if (ctx.transform.host === 'hook') {
+    for (const func of ctx.func.list) {
+      if (!func.sig) continue
+      if (func.sig.results[0] === 'f64') func.sig.results[0] = 'i64'
+      for (const p of func.sig.params) if (p.type === 'f64') p.type = 'i64'
+    }
+  }
   const funcFacts = new Map()
   for (const func of ctx.func.list) if (!func.raw) funcFacts.set(func, analyzeFuncForEmit(func, programFacts))
   const funcs = ctx.func.list.map(func => emitFunc(func, funcFacts.get(func), programFacts))

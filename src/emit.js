@@ -519,6 +519,9 @@ export function emitDecl(...inits) {
         updateRep(name, { ptrAux: val.closureFuncIdx })
       coerced = val.ptrKind === ptrKind ? val
         : typed(['i32.wrap_i64', ['i64.reinterpret_f64', asF64(val)]], 'i32')
+    } else if (ctx.transform.host === 'hook' && localType === 'f64' && val.type === 'i64') {
+      ctx.func.locals.set(name, 'i64')
+      coerced = val
     } else {
       coerced = localType === 'f64' ? asF64(val) : asI32(val)
     }
@@ -751,6 +754,8 @@ const cmpOp = (i32op, f64op, fn) => (a, b) => {
   const ai = intConstValue(a), bi = intConstValue(b)
   if (va.type === 'i32' && bi != null) return typed([`i32.${i32op}`, va, ['i32.const', bi]], 'i32')
   if (vb.type === 'i32' && ai != null) return typed([`i32.${i32op}`, ['i32.const', ai], vb], 'i32')
+  if (va.type === 'i64' || vb.type === 'i64')
+    return typed([`i64.${i32op}`, asI64(va), asI64(vb)], 'i32')
   return va.type === 'i32' && vb.type === 'i32'
     ? typed([`i32.${i32op}`, va, vb], 'i32') : typed([`f64.${f64op}`, asF64(va), asF64(vb)], 'i32')
 }
@@ -901,15 +906,14 @@ export const emitter = {
     if (ctx.transform.host === 'hook') {
       // In hook mode, lower throw → rollback(msg_ptr, msg_len, 0i64).
       // $hook_rollback is imported by module/hook/api.js with signature (i32 i32 i64) → i64.
-      // The thrown value is emitted into an f64 local; ptr/len are extracted if it's a string,
-      // otherwise ptr=0/len=0 and the reinterpreted bits are passed as the error code.
       inc('__ptr_offset', '__str_len')
       const thrown = temp()
+      ctx.func.locals.set(thrown, 'i64')
       return typed(['block',
-        ['local.set', `$${thrown}`, asF64(emit(expr))],
+        ['local.set', `$${thrown}`, asI64(emit(expr))],
         ['drop', ['call', '$hook_rollback',
-          ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${thrown}`]]],
-          ['call', '$__str_len', ['i64.reinterpret_f64', ['local.get', `$${thrown}`]]],
+          ['call', '$__ptr_offset', typed(['local.get', `$${thrown}`], 'i64')],
+          ['call', '$__str_len', typed(['local.get', `$${thrown}`], 'i64')],
           ['i64.const', 0]]],
         ['unreachable']], 'void')
     }
@@ -1419,6 +1423,7 @@ export const emitter = {
     if (isLit(vb) && litVal(vb) === 0) return va
     if (isLit(va) && litVal(va) === 0) return vb
     if (va.type === 'i32' && vb.type === 'i32') return typed(['i32.add', va, vb], 'i32')
+    if (va.type === 'i64' || vb.type === 'i64') return typed(['i64.add', asI64(va), asI64(vb)], 'i64')
     return typed(['f64.add', asF64(va), asF64(vb)], 'f64')
   },
   '-': (a, b) => {
@@ -1432,6 +1437,7 @@ export const emitter = {
     if (_f) return _f
     if (isLit(vb) && litVal(vb) === 0) return toNumF64(a, va)
     if (va.type === 'i32' && vb.type === 'i32') return typed(['i32.sub', va, vb], 'i32')
+    if (va.type === 'i64' || vb.type === 'i64') return typed(['i64.sub', asI64(va), asI64(vb)], 'i64')
     return typed(['f64.sub', toNumF64(a, va), toNumF64(b, vb)], 'f64')
   },
   'u+': a => {

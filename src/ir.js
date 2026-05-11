@@ -60,6 +60,8 @@ export const asF64 = n => {
 /** Coerce node to i32 (saturating — fast, correct for values < 2^31). */
 export const asI32 = n => {
   if (n.type === 'i32') return n
+  if (Array.isArray(n) && n[0] === 'i32.const') return typed(n, 'i32')
+  if (n.type === 'i64') return typed(['i32.wrap_i64', n], 'i32')
   // Peephole: trunc_sat_f64_s(convert_i32_*(x)) === x. The argument of f64.convert_i32_*
   // is i32 by WASM validation, so peel unconditionally and re-tag.
   if (Array.isArray(n) && (n[0] === 'f64.convert_i32_s' || n[0] === 'f64.convert_i32_u')) {
@@ -116,7 +118,14 @@ export const toI32 = n => {
 }
 
 /** Extract i64 from BigInt-as-f64. */
-export const asI64 = n => typed(['i64.reinterpret_f64', asF64(n)], 'i64')
+export const asI64 = n => {
+  if (n.type === 'i64') return n
+  // In hook mode all values are i64 NaN-boxed; i32→i64 sign-extension is correct.
+  // In non-hook mode i32 means a raw integer that must be converted to the NaN-boxed
+  // f64 bit representation, so fall through to the f64 roundtrip path.
+  if (n.type === 'i32' && ctx.transform.host === 'hook') return typed(['i64.extend_i32_s', n], 'i64')
+  return typed(['i64.reinterpret_f64', asF64(n)], 'i64')
+}
 
 /** Wrap i64 result back to BigInt-as-f64. */
 export const fromI64 = n => typed(['f64.reinterpret_i64', n], 'f64')
@@ -137,8 +146,12 @@ export const NULL_WAT = `(f64.const nan:${NULL_NAN})`
 export const UNDEF_WAT = `(f64.const nan:${UNDEF_NAN})`
 export const NULL_IR = ['f64.const', `nan:${NULL_NAN}`]
 export const UNDEF_IR = ['f64.const', `nan:${UNDEF_NAN}`]
-export const nullExpr = () => typed(NULL_IR, 'f64')
-export const undefExpr = () => typed(UNDEF_IR.slice(), 'f64')
+export const nullExpr = () => ctx.transform.host === 'hook'
+  ? typed(['i64.const', NULL_NAN], 'i64')
+  : typed(NULL_IR, 'f64')
+export const undefExpr = () => ctx.transform.host === 'hook'
+  ? typed(['i64.const', UNDEF_NAN], 'i64')
+  : typed(UNDEF_IR.slice(), 'f64')
 
 // === Constants ===
 
@@ -176,10 +189,13 @@ export function mkPtrIR(type, aux, offset) {
   const aIR = typeof aux === 'number' ? ['i32.const', aux] : aux
   const oIR = typeof offset === 'number' ? ['i32.const', offset] : offset
   const tL = litI32(tIR), aL = litI32(aIR), oL = litI32(oIR)
-  if (tL != null && aL != null && oL != null)
-    return typed(['f64.const', 'nan:' + packPtrBits(tL, aL, oL)], 'f64')
+  if (tL != null && aL != null && oL != null) {
+    const hexBits = packPtrBits(tL, aL, oL)
+    if (ctx.transform.host === 'hook') return typed(['i64.const', hexBits], 'i64')
+    return typed(['f64.const', 'nan:' + hexBits], 'f64')
+  }
   inc('__mkptr')
-  return typed(['call', '$__mkptr', tIR, aIR, oIR], 'f64')
+  return typed(['call', '$__mkptr', tIR, aIR, oIR], ctx.transform.host === 'hook' ? 'i64' : 'f64')
 }
 
 /** Offset extraction for a NaN-boxed pointer, specialized on known value type.
@@ -519,11 +535,14 @@ export function writeVar(name, valIR, void_) {
     coerced = valIR.ptrKind === ptrKind
       ? valIR
       : typed(['i32.wrap_i64', ['i64.reinterpret_f64', asF64(valIR)]], 'i32')
+  } else if (ctx.transform.host === 'hook' && t === 'f64' && valIR.type === 'i64') {
+    ctx.func.locals.set(name, 'i64')
+    coerced = valIR
   } else {
     coerced = t === 'f64' ? asF64(valIR) : asI32(valIR)
   }
   if (void_) return typed(['local.set', `$${name}`, coerced], 'void')
-  const teeNode = typed(['local.tee', `$${name}`, coerced], t)
+  const teeNode = typed(['local.tee', `$${name}`, coerced], ctx.func.locals.get(name) || t)
   if (ptrKind != null) teeNode.ptrKind = ptrKind
   return teeNode
 }

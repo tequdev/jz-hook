@@ -1622,6 +1622,14 @@ function walkRewrite(node, doInline, counts) {
   if (op === 'i64.reinterpret_f64' && node.length === 2) {
     const a = node[1]
     if (Array.isArray(a) && a[0] === 'f64.reinterpret_i64' && a.length === 2) return a[1]
+    if (Array.isArray(a) && a[0] === 'f64.const') {
+      const v = a[1]
+      if (typeof v === 'string' && v.startsWith('nan:')) return ['i64.const', v.slice(4)]
+      if (typeof v === 'number') {
+        const buf = new Float64Array([v]); const bits = new BigUint64Array(buf.buffer)[0]
+        return ['i64.const', '0x' + bits.toString(16).toUpperCase().padStart(16, '0')]
+      }
+    }
   }
   if (op === 'f64.reinterpret_i64' && node.length === 2) {
     const a = node[1]

@@ -14,7 +14,7 @@ export let hook = () => sfAccount
   // The constant (0x8001 = 32769) must appear inline — no function call.
   // In jz, integer constants are represented as f64 or i32 depending on context.
   ok(
-    wat.includes('f64.const') || wat.includes('i32.const'),
+    wat.includes('f64.const') || wat.includes('i32.const') || wat.includes('i64.const'),
     `expected an inlined numeric constant in WAT, got:\n${wat}`
   )
   // Must not contain a call instruction for sfAccount (it should be a compile-time const)
