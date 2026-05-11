@@ -221,10 +221,13 @@ export function reset(proto, globals) {
                         // Read by optimizeModule() (compile.js) and the post-watr pass (index.js).
                         // null is treated as level 2 (all on) for back-compat with internal callers.
     importMetaUrl: null, // compile-time URL for import.meta.url / import.meta.resolve static lowering.
-    host: 'js',         // 'js' (default): allow `env.__ext_*` imports to be wired by the JS host at
-                        // instantiation time. 'wasi': error at compile time if any `__ext_*` import
-                        // would be emitted, since wasmtime/wasmer hosts have no JS runtime to satisfy
-                        // them and silent fallback would corrupt output.
+    host: 'js',         // 'js' (default) | 'wasi' | 'hook'
+                        // 'hook': Xahau Hook smart contract. Enforces: guard insertion,
+                        //   no SIMD/exception/memory.grow/return_call, imports ⊆ env.* Hook API,
+                        //   exports exactly hook(i32)→i64 [+ cbak(i32)→i64].
+    hookOn: 0xFFFFFFFFFFFFFFFFn,   // sfHookOn bitmask (BigInt, used in SetHook metadata)
+    hookNamespace: null,            // sfHookNamespace (32-byte hex string or null)
+    hookMaxIter: 65535,             // Default loop guard max iteration count for _g() insertion
   }
 
   // Feature flags: capabilities the compiled module may exercise at runtime.
@@ -254,6 +257,8 @@ export function reset(proto, globals) {
     closure: false,   // First-class functions. Organic via ctx.closure.table population.
     timers: false,          // Set by prepare.js when timer module is included
     blockingTimers: false,   // wasmtime CLI: include __timer_loop in _start
+    hook: false,           // host:'hook' mode — Xahau Hook target. Enables guard insertion,
+                           // disables SIMD vectorization, enables Hook API lowering.
   }
 }
 

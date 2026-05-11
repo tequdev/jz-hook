@@ -28,19 +28,19 @@ import {
   isReassigned, hasOwnContinue, hasOwnBreakOrContinue, containsNestedClosure,
   containsNestedLoop, nestedSmallLoopBudget, containsDeclOf, cloneWithSubst,
   containsKnownTypedArrayIndex, smallConstForTripCount, isTerminator,
-  MAX_SMALL_FOR_UNROLL, MAX_NESTED_FOR_UNROLL,
+  MAX_NESTED_FOR_UNROLL,
 } from './ast.js'
 import {
   typed, asF64, asI32, asI64, asPtrOffset, asParamType, toI32, fromI64,
   NULL_IR, nullExpr, undefExpr, MAX_CLOSURE_ARITY,
   WASM_OPS, SPREAD_MUTATORS, BOXED_MUTATORS,
-  mkPtrIR, ptrOffsetIR, ptrTypeIR,
+  mkPtrIR, ptrOffsetIR,
   isLit, litVal, isNullishLit, isPureIR, emitNum, f64rem, toNumF64,
   truthyIR, toBoolFromEmitted, isPostfix,
   isGlobal, isConst, keyValType, usesDynProps, needsDynShadow,
   temp, tempI32, tempI64, allocPtr,
   boxedAddr, readVar, writeVar, isNullish,
-  isLiteralStr, resolveValType, isFuncRef,
+  isLiteralStr, resolveValType,
   multiCount, loopTop, flat,
   reconstructArgsWithSpreads,
 } from './ir.js'
@@ -888,6 +888,21 @@ export const emitter = {
   },
 
   'throw': expr => {
+    if (ctx.transform.host === 'hook') {
+      // In hook mode, lower throw → rollback(msg_ptr, msg_len, 0i64).
+      // $hook_rollback is imported by module/hook/api.js with signature (i32 i32 i64) → i64.
+      // The thrown value is emitted into an f64 local; ptr/len are extracted if it's a string,
+      // otherwise ptr=0/len=0 and the reinterpreted bits are passed as the error code.
+      inc('__ptr_offset', '__str_len')
+      const thrown = temp()
+      return typed(['block',
+        ['local.set', `$${thrown}`, asF64(emit(expr))],
+        ['drop', ['call', '$hook_rollback',
+          ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${thrown}`]]],
+          ['call', '$__str_len', ['i64.reinterpret_f64', ['local.get', `$${thrown}`]]],
+          ['i64.const', 0]]],
+        ['unreachable']], 'void')
+    }
     ctx.runtime.throws = true
     const thrown = temp()
     return typed(['block',
@@ -897,6 +912,7 @@ export const emitter = {
   },
 
   'catch': (body, errName, handler) => {
+    if (ctx.transform.host === 'hook') err('hook mode does not support try/catch/finally — use if/else error handling')
     if (!canThrow(body)) return emitFlat(body)
 
     ctx.runtime.throws = true
@@ -917,6 +933,7 @@ export const emitter = {
   },
 
   'finally': (body, cleanup) => {
+    if (ctx.transform.host === 'hook') err('hook mode does not support try/catch/finally — use if/else error handling')
     if (!canThrow(body)) {
       const parentStack = ctx.func.finallyStack || []
       const activeStack = parentStack.concat([cleanup])

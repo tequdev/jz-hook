@@ -13,4 +13,5 @@ import json from './json.js'
 import regex from './regex.js'
 import timer from './timer.js'
 import date from './date.js'
-export { math, core, array, object, string, number, fn, typedarray, collection, symbol, console, json, regex, timer, date }
+import hook from './hook/index.js'
+export { math, core, array, object, string, number, fn, typedarray, collection, symbol, console, json, regex, timer, date, hook }

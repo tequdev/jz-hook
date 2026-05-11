@@ -49,6 +49,7 @@ import jzify from './src/jzify.js'
 import {
   memory as enhanceMemory, instantiate as instantiateRuntime,
 } from './src/host.js'
+import { validateHook } from './src/hook-validate.js'
 
 const importSpecMayReturnExternal = (spec) => {
   if (typeof spec === 'function') return true
@@ -203,8 +204,19 @@ jz.compile = (code, opts = {}) => {
   if (opts.noTailCall) ctx.transform.noTailCall = true
   if (opts.strict) ctx.transform.strict = true
   if (opts.host) {
-    if (opts.host !== 'js' && opts.host !== 'wasi') err(`Invalid host '${opts.host}'. Expected 'js' or 'wasi'.`)
+    if (opts.host !== 'js' && opts.host !== 'wasi' && opts.host !== 'hook')
+      err(`Invalid host '${opts.host}'. Expected 'js', 'wasi', or 'hook'.`)
     ctx.transform.host = opts.host
+    if (opts.host === 'hook') {
+      // Enforce Hook constraints automatically
+      ctx.transform.strict = true
+      ctx.transform.alloc = false
+      ctx.transform.noTailCall = true
+      ctx.features.hook = true
+      if (opts.hookOn !== undefined) ctx.transform.hookOn = BigInt(opts.hookOn)
+      if (opts.namespace) ctx.transform.hookNamespace = opts.namespace
+      if (opts.maxIter !== undefined) ctx.transform.hookMaxIter = Number(opts.maxIter)
+    }
   }
   if (opts.alloc === false) ctx.transform.alloc = false
   if (opts.importMetaUrl) ctx.transform.importMetaUrl = String(opts.importMetaUrl)
@@ -241,6 +253,16 @@ jz.compile = (code, opts = {}) => {
       `Either annotate the receiver type, switch to a natively-supported method, or compile with the default host.`)
   }
 
+  // host: 'hook' — error if the wasm would import any env.__ext_* helper.
+  // Hook executors have no JS runtime to resolve these.
+  if (ctx.transform.host === 'hook' && ctx.core.extImports?.size) {
+    const ext = [...ctx.core.extImports].sort()
+    err(
+      `host: 'hook' — compiled wasm would require JS-host dynamic dispatch imports:\n  ` +
+      ext.map(n => `env.${n}`).join('\n  ') +
+      `\nUse strict mode and avoid dynamic dispatch. Import Hook API functions explicitly from 'hook'.`)
+  }
+
   const cfg = ctx.transform.optimize
   const optimized = cfg.watr ? time('watrOptimize', () => watrOptimize(module)) : module
   // Final peephole pass: watrOptimize's inliner can re-introduce rebox/unbox at boundaries
@@ -255,7 +277,14 @@ jz.compile = (code, opts = {}) => {
   }
   if (opts.wat) return time('watrPrint', () => watrPrint(optimized))
   const wasm = time('watrCompile', () => watrCompile(optimized))
-  return (opts.profileNames || opts.profile?.names) ? appendFunctionNames(wasm, optimized) : wasm
+  const namedWasm = (opts.profileNames || opts.profile?.names) ? appendFunctionNames(wasm, optimized) : wasm
+  // Hook validation: run automatically when host='hook' (or when --validate is explicitly passed).
+  // The validate pass is fast and provides essential early feedback about Hook binary compliance.
+  if (ctx.transform.host === 'hook' || opts.validate) {
+    const result = validateHook(namedWasm)
+    if (opts.verbose) process.stderr.write(`Hook validated: ${result.bytes} bytes\n`)
+  }
+  return namedWasm
 }
 
 /**

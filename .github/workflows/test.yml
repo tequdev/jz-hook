@@ -10,3 +10,10 @@ jobs:
           node-version: 22
       - run: npm install
       - run: npm test
+      - name: Test Hook mode
+        run: |
+          if [ -f test/hook/index.js ]; then
+            node test/hook/index.js
+          else
+            echo "Hook tests not yet implemented, skipping"
+          fi

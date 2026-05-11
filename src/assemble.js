@@ -422,6 +422,7 @@ export function optimizeModule(sec) {
     sortStrPoolByFreq([...sec.funcs, ...sec.stdlib, ...sec.start], poolRef, ctx.runtime.strPoolDedup)
     ctx.runtime.strPool = poolRef.pool
   }
+  if (cfg && ctx.transform.host) cfg.__host = ctx.transform.host
   for (const s of [...sec.funcs, ...sec.stdlib, ...sec.start]) optimizeFunc(s, cfg)
   if (!cfg || cfg.arenaRewind !== false) {
     const safeCallees = arenaRewindModule([...sec.funcs, ...sec.stdlib, ...sec.start])
@@ -449,6 +450,76 @@ export function optimizeModule(sec) {
         for (let i = 2; i < s.length; i++)
           if (Array.isArray(s[i]) && s[i][0] === 'global.set' && Array.isArray(s[i][2]) && s[i][2][0] === 'i32.const')
             s[i][2][1] = `${heapBase}`
+  }
+}
+
+/**
+ * Phase: Xahau Hook export wrappers.
+ *
+ * JZ compiles `hook` and `cbak` with the internal f64 calling convention
+ * (no params, f64 result). Xahau Hook requires the WASM signature:
+ *   (param i32) (result i64)
+ *
+ * This phase emits thin wrappers:
+ *   $__hook_export_hook  (export "hook")  (param i32) (result i64)
+ *     → i64.reinterpret_f64 (call $hook)
+ *   $__hook_export_cbak  (export "cbak")  (param i32) (result i64)
+ *     → i64.reinterpret_f64 (call $cbak)
+ *
+ * It also strips the raw (export "hook"/"cbak") from both the inline
+ * function attribute and any sec.customs alias entries, so the wrapper
+ * is the sole exported symbol with each name.
+ *
+ * Must be called after sec.customs aliases have been populated
+ * (post named-export-alias loop) and before treeshake so the wrappers
+ * are reachable from the export roots.
+ */
+export function buildHookExportFns(sec) {
+  if (ctx.transform.host !== 'hook') return
+
+  const HOOK_NAMES = ['hook', 'cbak']
+  for (const name of HOOK_NAMES) {
+    const innerName = `$${name}`
+    const boundaryWrapName = `$${name}$exp`
+    const wrapperName = `$__hook_export_${name}`
+
+    // Strip the inline (export "...") from the inner function AND from any
+    // JS-boundary wrapper ($hook$exp / $cbak$exp) that synthesizeBoundaryWrappers
+    // may have produced in hook mode.
+    for (const fn of sec.funcs) {
+      if (!Array.isArray(fn) || fn[0] !== 'func') continue
+      if (fn[1] !== innerName && fn[1] !== boundaryWrapName) continue
+      const expIdx = fn.findIndex(n => Array.isArray(n) && n[0] === 'export')
+      if (expIdx >= 0) fn.splice(expIdx, 1)
+    }
+
+    // Remove any sec.customs export alias pointing at this name (covers both
+    // the raw alias to $hook and the alias to $hook$exp when boundary-wrapped).
+    for (let i = sec.customs.length - 1; i >= 0; i--) {
+      const entry = sec.customs[i]
+      if (Array.isArray(entry) && entry[0] === 'export' && entry[1] === `"${name}"`)
+        sec.customs.splice(i, 1)
+    }
+
+    // Determine which inner function to call: prefer the boundary wrapper
+    // ($hook$exp / $cbak$exp) if it exists, since it re-boxes narrowed results
+    // back to f64. Fall back to the raw function otherwise.
+    const hasBoundaryWrap = sec.funcs.some(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === boundaryWrapName)
+    const callTarget = hasBoundaryWrap ? boundaryWrapName : innerName
+
+    // Only emit the wrapper if the inner function actually exists.
+    const innerExists = sec.funcs.some(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === innerName)
+    if (!innerExists) continue
+
+    // Wrapper: (param $reserved i32) (result i64)
+    //   body: i64.reinterpret_f64 (call $<target>)
+    sec.funcs.push([
+      'func', wrapperName,
+      ['export', `"${name}"`],
+      ['param', '$reserved', 'i32'],
+      ['result', 'i64'],
+      ['i64.reinterpret_f64', ['call', callTarget]],
+    ])
   }
 }
 

@@ -111,6 +111,7 @@ const MOD_DEPS = {
   date: ['core', 'number', 'string'],
   console: ['core', 'string', 'number'],
   regex: ['core', 'string', 'array'],
+  hook: ['core'],
 }
 
 export const hasModule = name => Boolean(mods[MOD_ALIAS[name] || name])

@@ -1519,7 +1519,7 @@ export function optimizeFunc(fn, cfg) {
   // narrow.js + watr have produced the canonical lane-local shape. Running it
   // pre-watr matches a noisier IR and would re-fire post-watr on the residual
   // tail — producing nested SIMD blocks. Single-pass via phase gating.
-  if (cfg && cfg.vectorizeLaneLocal === true && cfg.__phase === 'post') vectorizeLaneLocal(fn)
+  if (cfg && cfg.vectorizeLaneLocal === true && cfg.__phase === 'post' && cfg.__host !== 'hook') vectorizeLaneLocal(fn)
   if (!cfg || cfg.sortLocalsByUse !== false) sortLocalsByUse(fn, cfg && cfg.fusedRewrite !== false ? counts : null)
 }
 

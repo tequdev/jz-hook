@@ -40,6 +40,12 @@ Options:
   --wat                     Output WAT text instead of binary
   --resolve                 Resolve bare specifiers via Node.js module resolution
   --imports <file>          JSON file with host import specs (e.g. {"env":{"fn":{"params":2}}})
+  --host <env>              Target host environment (js, wasi, hook)
+  --hook-on <hex>           sfHookOn bitmask as BigInt hex (default: 0xFFFFFFFFFFFFFFFF, hook host only)
+  --namespace <hex>         sfHookNamespace 32-byte hex string (hook host only)
+  --max-iter <n>            Default loop guard iteration cap (default: 65535, hook host only)
+  --validate                Run hook-validate pass after compile (hook host only)
+  --hookapi-version <n>     Hook API version — currently only '0' is valid
   `)
 }
 
@@ -100,7 +106,7 @@ async function handleJzify(args) {
 }
 
 async function handleCompile(args) {
-  let inputFile = null, outputFile = null, wat = false, strict = false, resolveNode = false, importsFile = null
+  let inputFile = null, outputFile = null, wat = false, strict = false, resolveNode = false, importsFile = null, host = null, hookOn = null, namespace = null, maxIter = null, validate = false, hookapiVersion = null
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--output' || args[i] === '-o') outputFile = args[++i]
@@ -108,6 +114,12 @@ async function handleCompile(args) {
     else if (args[i] === '--strict') strict = true
     else if (args[i] === '--resolve') resolveNode = true
     else if (args[i] === '--imports') importsFile = args[++i]
+    else if (args[i] === '--host') host = args[++i]
+    else if (args[i] === '--hook-on') hookOn = args[++i]
+    else if (args[i] === '--namespace') namespace = args[++i]
+    else if (args[i] === '--max-iter') maxIter = parseInt(args[++i], 10)
+    else if (args[i] === '--validate') validate = true
+    else if (args[i] === '--hookapi-version') hookapiVersion = args[++i]
     else if (!inputFile) inputFile = args[i]
   }
 
@@ -176,6 +188,11 @@ async function handleCompile(args) {
     const importsPath = resolve(importsFile)
     opts.imports = JSON.parse(readFileSync(importsPath, 'utf8'))
   }
+  if (host) opts.host = host
+  if (hookOn !== null) opts.hookOn = hookOn
+  if (namespace !== null) opts.namespace = namespace
+  if (maxIter !== null) opts.maxIter = maxIter
+  if (validate) opts.validate = true
 
   const result = compile(code, opts)
 

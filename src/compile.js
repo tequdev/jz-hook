@@ -50,7 +50,9 @@ import plan from './plan.js'
 import {
   buildStartFn, dedupClosureBodies, finalizeClosureTable,
   pullStdlib, syncImports, optimizeModule, stripStaticDataPrefix,
+  buildHookExportFns,
 } from './assemble.js'
+import { insertGuards } from './guard.js'
 
 const timePhase = (profiler, name, fn) => profiler ? profiler.time(name, fn) : fn()
 
@@ -288,7 +290,9 @@ function emitFunc(func, funcFacts, programFacts) {
   const fn = ['func', `$${name}`]
   // Boundary-wrapped exports defer the export attribute to a synthesized
   // wrapper ($${name}$exp) that reboxes the narrowed result back to f64.
-  if (exported && !isBoundaryWrapped(func)) fn.push(['export', `"${name}"`])
+  // In hook mode, only 'hook' and 'cbak' are exported; all others are suppressed.
+  const hookModeExportOk = ctx.transform.host !== 'hook' || name === 'hook' || name === 'cbak'
+  if (exported && !isBoundaryWrapped(func) && hookModeExportOk) fn.push(['export', `"${name}"`])
   fn.push(...sig.params.map(p => ['param', `$${p.name}`, p.type]))
   fn.push(...sig.results.map(t => ['result', t]))
 
@@ -389,7 +393,11 @@ function synthesizeBoundaryWrappers() {
     // so callers seeing the raw export get a plain Number for numerics.
     const paramI64 = sig.params.map(p => p.ptrKind != null)
     const resultI64 = sig.ptrKind != null
-    const wrapNode = ['func', `$${name}$exp`, ['export', `"${name}"`]]
+    // In hook mode, suppress the JS-boundary wrapper export for non-hook/cbak functions.
+    const hookModeWrapOk = ctx.transform.host !== 'hook' || name === 'hook' || name === 'cbak'
+    const wrapNode = hookModeWrapOk
+      ? ['func', `$${name}$exp`, ['export', `"${name}"`]]
+      : ['func', `$${name}$exp`]
     sig.params.forEach((p, i) => wrapNode.push(['param', `$${p.name}`, paramI64[i] ? 'i64' : 'f64']))
     wrapNode.push(['result', resultI64 ? 'i64' : 'f64'])
     const args = sig.params.map((p, i) => {
@@ -829,6 +837,8 @@ export default function compile(ast, profiler) {
 
   optimizeModule(sec)
 
+  if (ctx.transform.host === 'hook') insertGuards(sec)
+
   // Populate globals (after __start — const folding may update declarations)
   sec.globals.push(...[...ctx.scope.globals.values()].filter(g => g).map(g => parseWat(g)))
 
@@ -897,6 +907,8 @@ export default function compile(ast, profiler) {
   // Named export aliases: export { name } or export { source as alias }
   for (const [name, val] of Object.entries(ctx.func.exports)) {
     if (wasiCommandExports.has(name)) continue
+    // In hook mode, only 'hook' and 'cbak' aliases are emitted.
+    if (ctx.transform.host === 'hook' && name !== 'hook' && name !== 'cbak') continue
     if (val === true) {
       if (ctx.scope.userGlobals?.has(name)) sec.customs.push(['export', `"${name}"`, ['global', `$${name}`]])
       continue
@@ -908,6 +920,17 @@ export default function compile(ast, profiler) {
     if (func) sec.customs.push(['export', `"${name}"`, ['func', `$${isBoundaryWrapped(func) ? val + '$exp' : val}`]])
     else if (ctx.scope.globals.has(val)) sec.customs.push(['export', `"${name}"`, ['global', `$${val}`]])
   }
+
+  // In hook mode: validate 'hook' export exists (required entry point).
+  if (ctx.transform.host === 'hook') {
+    const hookExported = ctx.func.list.some(f => f.name === 'hook' && f.exported) ||
+      Object.prototype.hasOwnProperty.call(ctx.func.exports, 'hook')
+    if (!hookExported) err('hook mode requires an exported function named "hook"')
+  }
+
+  // In hook mode: emit thin (i32)→i64 wrappers for 'hook' and 'cbak' exports.
+  // Must run after sec.customs aliases are populated and before treeshake.
+  buildHookExportFns(sec)
 
   // Whole-module: prune funcs unreachable from entry points (start, exports, elem refs).
   // Removes orphan top-level consts that never get called (e.g. watr's unused `hoist` = 26 KB).

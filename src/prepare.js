@@ -183,6 +183,7 @@ export default function prepare(node) {
   scopes = []
   funcLocalNames = [new Set()]
   includeModule('core')
+  if (ctx.transform.host === 'hook') includeModule('hook')
   normalizeIdents(node)
   fuseSparseMapReads(node)
   const ast = prep(node)

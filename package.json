@@ -1,7 +1,7 @@
 {
-  "name": "jz",
-  "version": "0.2.1",
-  "description": "Modern functional JS compiling to WASM",
+  "name": "jz-hook",
+  "version": "0.2.1-hook.1",
+  "description": "Modern functional JS compiling to WASM — optimized for Xahau Hook smart contracts",
   "main": "index.js",
   "type": "module",
   "exports": {
@@ -17,7 +17,8 @@
     "README.md"
   ],
   "bin": {
-    "jz": "cli.js"
+    "jz": "cli.js",
+    "jz-hook": "cli.js"
   },
   "scripts": {
     "test": "node test/index.js",
@@ -47,7 +48,11 @@
     "compiler",
     "functional",
     "minimal",
-    "wasm"
+    "wasm",
+    "xahau",
+    "hooks",
+    "smart-contract",
+    "blockchain"
   ],
   "devDependencies": {
     "tst": "^9.4.0"
