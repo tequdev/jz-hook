@@ -513,6 +513,18 @@ export function buildHookExportFns(sec) {
       const body = innerFunc.splice(headerEnd)
       innerFunc.push(['i64.reinterpret_f64', ['block', ['result', 'f64'], ...body]])
     }
+
+    // Xahau requires _g to appear at least once in every hook/cbak execution path.
+    // If the guard pass didn't inject one (no loops), prepend _g(0, 0) at function entry.
+    const hasGuard = innerFunc.some(n =>
+      Array.isArray(n) && n[0] === 'drop' &&
+      Array.isArray(n[1]) && n[1][0] === 'call' && n[1][1] === '$hook__g'
+    )
+    if (!hasGuard) {
+      const bodyStart = findBodyStart(innerFunc)
+      innerFunc.splice(bodyStart, 0,
+        ['drop', ['call', '$hook__g', ['i32.const', 0], ['i32.const', 0]]])
+    }
   }
 }
 
