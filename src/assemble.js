@@ -501,17 +501,29 @@ export function buildHookExportFns(sec) {
     // This avoids a thin wrapper function entirely — one fewer defined function in the binary.
     innerFunc.splice(2, 0, ['export', `"${name}"`], ['param', '$reserved', 'i32'])
 
-    // If the body returns f64 (should not happen in hook mode but handle defensively):
-    // re-wrap with i64.reinterpret_f64 via a block so the result type is correct.
+    // Ensure the function returns i64 as required by Xahau's (param i32)(result i64) ABI.
+    // In hook mode the body normally returns i64; handle i32/f64 defensively.
     const resultIdx = innerFunc.findIndex(n => Array.isArray(n) && n[0] === 'result')
-    if (resultIdx >= 0 && innerFunc[resultIdx][1] === 'f64') {
+    if (resultIdx >= 0 && innerFunc[resultIdx][1] !== 'i64') {
+      const origType = innerFunc[resultIdx][1]  // 'i32' or 'f64'
+      const wrapOp = origType === 'i32' ? 'i64.extend_i32_s' : 'i64.reinterpret_f64'
       innerFunc[resultIdx][1] = 'i64'
-      // Collect body nodes (everything after param/result/local/export headers)
-      const headerEnd = innerFunc.findLastIndex(n =>
-        Array.isArray(n) && (n[0] === 'param' || n[0] === 'result' || n[0] === 'local' || n[0] === 'export')
-      ) + 1
-      const body = innerFunc.splice(headerEnd)
-      innerFunc.push(['i64.reinterpret_f64', ['block', ['result', 'f64'], ...body]])
+      // Walk body recursively and wrap all explicit `return val` nodes in-place.
+      // Using a block wrapper would shift all br-depth labels — unsafe. Transform returns instead.
+      ;(function wrapReturns(node) {
+        if (!Array.isArray(node)) return
+        // ['return', val] — wrap the value so it satisfies the function's new i64 result type
+        if (node[0] === 'return' && node.length >= 2) { node[1] = [wrapOp, node[1]]; return }
+        for (let i = 1; i < node.length; i++) wrapReturns(node[i])
+      })(innerFunc)
+      // Also wrap the final implicit fallthrough value (the last body node, if it's a plain expression).
+      const bodyEnd = innerFunc.length - 1
+      const last = innerFunc[bodyEnd]
+      if (Array.isArray(last) && last[0] !== 'return' && last[0] !== 'unreachable' &&
+          last[0] !== 'br' && last[0] !== 'br_if' && last[0] !== 'if' && last[0] !== 'block' &&
+          last[0] !== 'loop' && last[0] !== 'drop') {
+        innerFunc[bodyEnd] = [wrapOp, last]
+      }
     }
 
     // Xahau requires _g to appear at least once in every hook/cbak execution path.
