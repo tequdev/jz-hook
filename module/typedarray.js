@@ -9,8 +9,8 @@
 
 import { typed, asF64, asI32, asI64, UNDEF_NAN, allocPtr, mkPtrIR, ptrOffsetIR, temp, tempI32, undefExpr } from '../src/ir.js'
 import { emit } from '../src/emit.js'
-import { valTypeOf, lookupValType, VAL } from '../src/analyze.js'
-import { inc, PTR } from '../src/ctx.js'
+import { valTypeOf, lookupValType, VAL, nonNegIntLiteral } from '../src/analyze.js'
+import { ctx, inc, PTR } from '../src/ctx.js'
 
 
 // Element types and their byte sizes
@@ -318,6 +318,23 @@ export default (ctx) => {
               ['then', ctx.core.emit[`${name}.from`](src)],
               ['else', mkPtrIR(PTR.TYPED, aux,
                 ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${src}`]]])]]]]], 'f64')
+      }
+      // Hook mode: constant-size typed array → pre-allocate in data section (no runtime allocator).
+      // Layout: [byteLen:i32 LE][byteCap:i32 LE][byteLen zero bytes]; ptr = base+8.
+      // stripStaticDataPrefix will adjust the pointer by -staticDataLen after compilation.
+      if (ctx.transform.host === 'hook' && offsetExpr == null && lenExpr2 == null) {
+        const constN = nonNegIntLiteral(lenExpr)
+        if (constN != null) {
+          const byteLen = constN * STRIDE[elemType]
+          const data = ctx.runtime.data || ''
+          const base = (data.length + 3) & ~3  // 4-byte aligned
+          const le32 = n => String.fromCharCode(n & 0xFF, (n>>8) & 0xFF, (n>>16) & 0xFF, (n>>24) & 0xFF)
+          ctx.runtime.data = data + '\x00'.repeat(base - data.length) + le32(byteLen) + le32(byteLen) + '\x00'.repeat(byteLen)
+          const ptr = base + 8
+          // PTR.TYPED=3: NAN_PREFIX(0x7FF8)|(3<<47) = 0x7FF98000_00000000
+          const nanBox = 0x7FF9800000000000n | (BigInt(aux) << 32n) | BigInt(ptr)
+          return typed(['i64.const', '0x' + nanBox.toString(16).toUpperCase().padStart(16, '0')], 'i64')
+        }
       }
       // Normal: allocate fresh typed array (lenExpr is numeric size). Header stores byteLen.
       const shift = SHIFT[elemType]

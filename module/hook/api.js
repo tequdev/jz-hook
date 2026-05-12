@@ -158,10 +158,14 @@ export default (ctx) => {
     const ir = asI64(emit(v))
     const bits = getI64Bits(ir)
     if (bits != null) {
-      const offset = Number(bits & 0xFFFFFFFFn)
-      const len = readDataI32(offset - 4)
-      if (len != null)
-        return [typed(['i32.const', offset], 'i32'), typed(['i32.const', len], 'i32')]
+      const rawOffset = Number(bits & 0xFFFFFFFFn)
+      const len = readDataI32(rawOffset - 4)
+      if (len != null) {
+        // rawOffset is the pre-strip heap address; stripStaticDataPrefix will subtract
+        // staticDataLen from i64.const nodes, so we pre-apply the same adjustment here.
+        const ptr = rawOffset - (ctx.runtime.staticDataLen || 0)
+        return [typed(['i32.const', ptr], 'i32'), typed(['i32.const', len], 'i32')]
+      }
     }
     if (ir[0] === 'local.get' || ir[0] === 'global.get') {
       return [
@@ -182,10 +186,12 @@ export default (ctx) => {
     const ir = asI64(emit(v))
     const bits = getI64Bits(ir)
     if (bits != null) {
-      const offset = Number(bits & 0xFFFFFFFFn)
-      const len = readDataI32(offset - 8)
-      if (len != null)
-        return [typed(['i32.const', offset], 'i32'), typed(['i32.const', len], 'i32')]
+      const rawOffset = Number(bits & 0xFFFFFFFFn)
+      const len = readDataI32(rawOffset - 8)
+      if (len != null) {
+        const ptr = rawOffset - (ctx.runtime.staticDataLen || 0)
+        return [typed(['i32.const', ptr], 'i32'), typed(['i32.const', len], 'i32')]
+      }
     }
     if (ir[0] === 'local.get' || ir[0] === 'global.get') {
       return [
