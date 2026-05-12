@@ -480,65 +480,39 @@ export function buildHookExportFns(sec) {
   const HOOK_NAMES = ['hook', 'cbak']
   for (const name of HOOK_NAMES) {
     const innerName = `$${name}`
-    const boundaryWrapName = `$${name}$exp`
-    const wrapperName = `$__hook_export_${name}`
 
-    // Strip the inline (export "...") from the inner function AND from any
-    // JS-boundary wrapper ($hook$exp / $cbak$exp) that synthesizeBoundaryWrappers
-    // may have produced in hook mode.
-    for (const fn of sec.funcs) {
-      if (!Array.isArray(fn) || fn[0] !== 'func') continue
-      if (fn[1] !== innerName && fn[1] !== boundaryWrapName) continue
-      const expIdx = fn.findIndex(n => Array.isArray(n) && n[0] === 'export')
-      if (expIdx >= 0) fn.splice(expIdx, 1)
-    }
-
-    // Remove any sec.customs export alias pointing at this name (covers both
-    // the raw alias to $hook and the alias to $hook$exp when boundary-wrapped).
+    // Remove any sec.customs export alias for this name.
     for (let i = sec.customs.length - 1; i >= 0; i--) {
       const entry = sec.customs[i]
       if (Array.isArray(entry) && entry[0] === 'export' && entry[1] === `"${name}"`)
         sec.customs.splice(i, 1)
     }
 
-    // In hook mode, always call the inner function directly — the boundary wrapper
-    // ($hook$exp) re-boxes to f64 which is wrong when the inner function returns i64.
-    const callTarget = innerName
+    // Find the inner function.
+    const innerFunc = sec.funcs.find(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === innerName)
+    if (!innerFunc) continue
 
-    // Only emit the wrapper if the inner function actually exists.
-    const innerExists = sec.funcs.some(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === innerName)
-    if (!innerExists) continue
+    // Strip any existing (export "...") attribute so we can re-add it cleanly.
+    const expIdx = innerFunc.findIndex(n => Array.isArray(n) && n[0] === 'export')
+    if (expIdx >= 0) innerFunc.splice(expIdx, 1)
 
-    // Wrapper: (param $reserved i32) (result i64)
-    //   body: (call $<target> [args]) — skip reinterpret if target already returns i64
-    const callTargetFunc = sec.funcs.find(fn => Array.isArray(fn) && fn[0] === 'func' && fn[1] === callTarget)
-    const callTargetReturnsI64 = callTargetFunc && callTargetFunc.some(n => Array.isArray(n) && n[0] === 'result' && n[1] === 'i64')
-    const callTargetReturnsI32 = callTargetFunc && callTargetFunc.some(n => Array.isArray(n) && n[0] === 'result' && n[1] === 'i32')
-    // Pass $reserved to the inner function's params (first param gets $reserved, extras get i64 undef)
-    const callTargetParams = callTargetFunc
-      ? callTargetFunc.filter(n => Array.isArray(n) && n[0] === 'param')
-      : []
-    const args = callTargetParams.map((p, idx) => {
-      const paramType = p[2]
-      if (idx === 0) {
-        if (paramType === 'i64') return ['i64.extend_i32_s', ['local.get', '$reserved']]
-        if (paramType === 'i32') return ['local.get', '$reserved']
-        return ['f64.convert_i32_s', ['local.get', '$reserved']]
-      }
-      return ['i64.const', '0x7FF9000000000000']  // extra params: NaN-boxed undefined
-    })
-    const callExpr = callTargetReturnsI64
-      ? ['call', callTarget, ...args]
-      : callTargetReturnsI32
-        ? ['i64.extend_i32_s', ['call', callTarget, ...args]]
-        : ['i64.reinterpret_f64', ['call', callTarget, ...args]]
-    sec.funcs.push([
-      'func', wrapperName,
-      ['export', `"${name}"`],
-      ['param', '$reserved', 'i32'],
-      ['result', 'i64'],
-      callExpr,
-    ])
+    // Mutate $hook in-place to satisfy the Xahau calling convention (param i32)(result i64).
+    // In hook mode the body already returns i64; we only need to inject the ignored i32 param.
+    // This avoids a thin wrapper function entirely — one fewer defined function in the binary.
+    innerFunc.splice(2, 0, ['export', `"${name}"`], ['param', '$reserved', 'i32'])
+
+    // If the body returns f64 (should not happen in hook mode but handle defensively):
+    // re-wrap with i64.reinterpret_f64 via a block so the result type is correct.
+    const resultIdx = innerFunc.findIndex(n => Array.isArray(n) && n[0] === 'result')
+    if (resultIdx >= 0 && innerFunc[resultIdx][1] === 'f64') {
+      innerFunc[resultIdx][1] = 'i64'
+      // Collect body nodes (everything after param/result/local/export headers)
+      const headerEnd = innerFunc.findLastIndex(n =>
+        Array.isArray(n) && (n[0] === 'param' || n[0] === 'result' || n[0] === 'local' || n[0] === 'export')
+      ) + 1
+      const body = innerFunc.splice(headerEnd)
+      innerFunc.push(['i64.reinterpret_f64', ['block', ['result', 'f64'], ...body]])
+    }
   }
 }
 

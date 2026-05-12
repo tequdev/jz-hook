@@ -23,17 +23,14 @@ test('hook/hello: WAT contains (export "hook")', () => {
   ok(wat.includes('(export "hook")'), `expected (export "hook") in WAT, got:\n${wat}`)
 })
 
-test('hook/hello: WAT contains $__hook_export_hook wrapper', () => {
+test('hook/hello: hook export has (param i32) (result i64) signature — no wrapper', () => {
   const wat = compile(`export let hook = () => "OK"`, { host: 'hook', wat: true, jzify: true })
-  ok(wat.includes('$__hook_export_hook'), `expected $__hook_export_hook in WAT, got:\n${wat}`)
-})
-
-test('hook/hello: hook export wrapper has (param i32) (result i64) signature', () => {
-  const wat = compile(`export let hook = () => "OK"`, { host: 'hook', wat: true, jzify: true })
-  // The wrapper function must accept i32 (reserved arg from executor) and return i64
+  // $hook is mutated in-place: no separate $__hook_export_hook wrapper
+  ok(!wat.includes('$__hook_export_hook'), `unexpected wrapper $__hook_export_hook in WAT`)
+  // The exported $hook function itself must carry the i32 param and i64 result
   ok(
     wat.includes('(param $reserved i32)') || wat.includes('(param i32)'),
-    `expected (param i32) in wrapper, got:\n${wat}`
+    `expected (param i32) in $hook, got:\n${wat}`
   )
-  ok(wat.includes('(result i64)'), `expected (result i64) in wrapper, got:\n${wat}`)
+  ok(wat.includes('(result i64)'), `expected (result i64) in $hook, got:\n${wat}`)
 })
