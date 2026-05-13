@@ -44,7 +44,7 @@ Options:
   --output, -o <file>       Output file (.wat, .wasm, or - for stdout)
   -O<n>, --optimize <n>     Optimization level: 0 off, 1 size-only, 2 default,
                             3 aggressive. Aliases: -Os/size, -Ob/balanced, -Of/speed.
-  --host <js|wasi|hook>     Target host environment (default js)
+  --host <js|wasi|hook>     Target host environment (default hook)
   --no-alloc                Omit _alloc/_clear allocator exports (standalone wasm)
   --names                   Emit wasm name section for profilers/debuggers
   --strict                  Strict jz mode (no auto-transform), reject dynamic fallbacks
@@ -53,13 +53,13 @@ Options:
   --wat                     Output WAT text instead of binary
   --resolve                 Resolve bare specifiers via Node.js module resolution
   --imports <file>          JSON file with host import specs (e.g. {"env":{"fn":{"params":2}}})
-  --hook-on <hex>           sfHookOn bitmask as BigInt hex (default: 0xFFFFFFFFFFFFFFFF, hook host only)
-  --namespace <hex>         sfHookNamespace 32-byte hex string (hook host only)
   --max-iter <n>            Default loop guard iteration cap (default: 65535, hook host only)
   --validate                Run hook-validate pass after compile (hook host only)
-  --hookapi-version <n>     Hook API version — currently only '0' is valid
   --version, -v             Show version number
   `)
+  // --hook-on <hex>           sfHookOn bitmask as BigInt hex (default: 0xFFFFFFFFFFFFFFFF, hook host only)
+  // --namespace <hex>         sfHookNamespace 32-byte hex string (hook host only)
+  // --hookapi-version <n>     Hook API version — currently only '0' is valid
 }
 
 async function main() {
@@ -133,7 +133,7 @@ function parseOptimize(v) {
 
 async function handleCompile(args) {
   let inputFile = null, outputFile = null, wat = false, strict = false, resolveNode = false, importsFile = null
-  let optimize, host, alloc = true, names = false
+  let optimize, host = 'hook', alloc = true, names = false
   let hookOn = null, namespace = null, maxIter = null, validate = false, hookapiVersion = null
 
   for (let i = 0; i < args.length; i++) {

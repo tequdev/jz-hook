@@ -15,7 +15,7 @@ export let hook = () => {
 ```
 
 ```sh
-$ jz-hook --host hook hello.js -o hello.wasm
+$ jz-hook hello.js -o hello.wasm
 hello.js → hello.wasm (842 bytes, validated, 12 imports, 3 guards)
 ```
 
@@ -33,13 +33,13 @@ Write plain JS, compile to a valid [Xahau Hook](https://docs.xahau.network/techn
 npm install -g jz-hook
 
 # Compile a Hook
-jz-hook --host hook hook.js -o hook.wasm
+jz-hook  hook.js -o hook.wasm
 
 # View generated WAT
-jz-hook --host hook --wat hook.js
+jz-hook --wat hook.js
 
 # Validate output meets Hook constraints
-jz-hook --host hook --validate hook.js -o hook.wasm
+jz-hook --validate hook.js -o hook.wasm
 ```
 
 ### Options
@@ -47,8 +47,8 @@ jz-hook --host hook --validate hook.js -o hook.wasm
 | Option | Description |
 |--------|-------------|
 | `--host hook` | Compile for Xahau Hook (Guard-type v0) |
-| `--hook-on <hex>` | `sfHookOn` bitmask (default: all enabled) |
-| `--namespace <hex>` | `sfHookNamespace` (32-byte hex) |
+<!-- | `--hook-on <hex>` | `sfHookOn` bitmask (default: all enabled) | -->
+<!-- | `--namespace <hex>` | `sfHookNamespace` (32-byte hex) | -->
 | `--max-iter <n>` | Default loop guard iteration cap (default: 65535) |
 | `--validate` | Verify output WASM meets Hook constraints |
 | `-O<n>`, `--optimize <n>` | Optimization level or alias (`size`, `balanced`, `speed`) |
