@@ -217,6 +217,16 @@ jz.compile = (code, opts = {}) => {
   if (opts.importMetaUrl) ctx.transform.importMetaUrl = String(opts.importMetaUrl)
   if (opts.nativeTimers) ctx.features.blockingTimers = true  // wasmtime CLI: include __timer_loop in _start
   ctx.transform.optimize = resolveOptimize(opts.optimize)
+  if (
+    ctx.transform.host === 'hook' &&
+    opts.optimize !== false &&
+    opts.optimize !== 0 &&
+    !(opts.optimize && typeof opts.optimize === 'object' && Object.prototype.hasOwnProperty.call(opts.optimize, 'watr'))
+  ) {
+    // Hook binaries are size-constrained by the ledger. The general default keeps
+    // watr off for compile-time speed, but hook output needs its whole-module DCE.
+    ctx.transform.optimize.watr = true
+  }
 
   if (opts._interp) {
     for (const [name, fn] of Object.entries(opts._interp)) {
