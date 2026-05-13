@@ -3,7 +3,8 @@
  * Usage: import { sfAccount, sfDestination, KEYLET_ACCOUNT } from 'hook'
  * Each constant is lowered to an i32.const at compile time.
  */
-import { asI32, typed } from '../../src/ir.js'
+import { asI32, asI64, typed } from '../../src/ir.js'
+import { emit as emitNode } from '../../src/emit.js'
 
 export const SF_CODES = {
   sfInvalid: -1,
@@ -95,6 +96,11 @@ export const KEYLET_TYPES = {
 }
 
 export default (ctx) => {
+  // Extract the low 32 bits (heap ptr) from a NaN-boxed buffer/string or integer arg.
+  // For buffers/strings: low 32 bits of i64 NaN-box = heap address.
+  // For integer 0: i32.wrap_i64(i64.reinterpret_f64(0.0)) = 0.
+  const eptr = (v) => typed(['i32.wrap_i64', asI64(emitNode(v))], 'i32')
+
   // Register all sfcodes as compile-time i32 constants
   for (const [name, val] of Object.entries(SF_CODES)) {
     ctx.core.emit[`hook.${name}`] = () => typed(['i32.const', val], 'i32')
@@ -129,20 +135,20 @@ export default (ctx) => {
   for (const [name, type, twoArg, arg1Len, arg2Len] of KEYLET_SPECS) {
     if (twoArg) {
       ctx.core.emit[`hook.keylet_${name}`] = (wPtr, arg1Ptr, arg2Ptr) =>
-        ['call', '$hook_util_keylet',
-          asI32(wPtr), ['i32.const', 34],
+        typed(['call', '$hook_util_keylet',
+          eptr(wPtr), ['i32.const', 34],
           ['i32.const', type],
-          asI32(arg1Ptr), ['i32.const', arg1Len],
-          asI32(arg2Ptr), ['i32.const', arg2Len],
-          ['i32.const', 0], ['i32.const', 0]]
+          eptr(arg1Ptr), ['i32.const', arg1Len],
+          eptr(arg2Ptr), ['i32.const', arg2Len],
+          ['i32.const', 0], ['i32.const', 0]], 'i64')
     } else {
       ctx.core.emit[`hook.keylet_${name}`] = (wPtr, arg1Ptr) =>
-        ['call', '$hook_util_keylet',
-          asI32(wPtr), ['i32.const', 34],
+        typed(['call', '$hook_util_keylet',
+          eptr(wPtr), ['i32.const', 34],
           ['i32.const', type],
-          asI32(arg1Ptr), ['i32.const', arg1Len],
+          eptr(arg1Ptr), ['i32.const', arg1Len],
           ['i32.const', 0], ['i32.const', 0],
-          ['i32.const', 0], ['i32.const', 0]]
+          ['i32.const', 0], ['i32.const', 0]], 'i64')
     }
   }
 }
