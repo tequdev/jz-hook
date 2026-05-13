@@ -24,12 +24,13 @@
     "test": "node test/index.js",
     "test262": "node test/test262.js",
     "test262:builtins": "node test/test262-builtins.js",
+    "test:hook": "node test/hook/index.js",
     "bench": "node bench/bench.mjs",
     "bench:size": "node scripts/bench-size.mjs",
     "bench:compile": "node scripts/bench-compile.mjs",
     "test:bench-pin": "node test/bench-pin.js",
-    "test:all": "npm test && npm run test:bench-pin",
-    "prepublishOnly": "npm run test:all"
+    "test:hook-pin": "node test/hook-pin.js",
+    "prepublishOnly": "npm run test:hook && npm run test:hook-pin"
   },
   "repository": {
     "type": "git",
