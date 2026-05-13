@@ -7,11 +7,8 @@
  *
  * Setup — add to tsconfig.json:
  *   "compilerOptions": {
- *     "paths": { "hook": ["./node_modules/jz-hook/types/hook"] }
+ *     "paths": { "hook": ["jz-hook/types"] }
  *   }
- *
- * Or with triple-slash reference at the top of your hook source file:
- *   /// <reference types="jz-hook/types/hook" />
  */
 
 declare module 'hook' {

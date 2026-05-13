@@ -7,7 +7,7 @@
   "exports": {
     ".": "./index.js",
     "./wasi": "./wasi.js",
-    "./types/hook": "./types/hook.d.ts"
+    "./types": "./types/hook.d.ts"
   },
   "files": [
     "index.js",
