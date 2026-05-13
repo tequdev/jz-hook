@@ -572,7 +572,7 @@ export function buildHookExportFns(sec) {
     }
 
     // Xahau requires _g to appear at least once in every hook/cbak execution path.
-    // If the guard pass didn't inject one (no loops), prepend _g(0, 0) at function entry.
+    // If the guard pass didn't inject one (no loops), prepend _g(1, 1) at function entry.
     const hasGuard = innerFunc.some(n =>
       Array.isArray(n) && n[0] === 'drop' &&
       Array.isArray(n[1]) && n[1][0] === 'call' && n[1][1] === '$hook__g'
@@ -580,7 +580,7 @@ export function buildHookExportFns(sec) {
     if (!hasGuard) {
       const bodyStart = findBodyStart(innerFunc)
       innerFunc.splice(bodyStart, 0,
-        ['drop', ['call', '$hook__g', ['i32.const', 0], ['i32.const', 0]]])
+        ['drop', ['call', '$hook__g', ['i32.const', 1], ['i32.const', 1]]])
     }
   }
 }
