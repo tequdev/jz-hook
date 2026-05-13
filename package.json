@@ -6,7 +6,8 @@
   "type": "module",
   "exports": {
     ".": "./index.js",
-    "./wasi": "./wasi.js"
+    "./wasi": "./wasi.js",
+    "./types/hook": "./types/hook.d.ts"
   },
   "files": [
     "index.js",
@@ -14,6 +15,7 @@
     "wasi.js",
     "src",
     "module",
+    "types",
     "README.md"
   ],
   "bin": {
