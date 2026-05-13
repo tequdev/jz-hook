@@ -59,9 +59,9 @@ export default (ctx) => {
   ensureHookImport(ctx, 'etxn_reserve', ['i32'])
   ensureHookImport(ctx, 'etxn_details', ['i32', 'i32'])
   ensureHookImport(ctx, 'etxn_burden', [])
+  ensureHookImport(ctx, 'etxn_generation', [])
   ensureHookImport(ctx, 'etxn_nonce', ['i32', 'i32'])
-  ensureHookImport(ctx, 'etxn_fee_base', ['i64'])
-  ensureHookImport(ctx, 'etxn_manifest', ['i32', 'i32', 'i32', 'i32'])
+  ensureHookImport(ctx, 'etxn_fee_base', ['i32', 'i32'])
   ensureHookImport(ctx, 'emit', ['i32', 'i32', 'i32', 'i32'])
 
   // === Outgoing transaction fields ===
@@ -82,6 +82,7 @@ export default (ctx) => {
   ensureHookImport(ctx, 'slot_subfield', ['i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'slot_type', ['i32', 'i32'])
   ensureHookImport(ctx, 'slot_float', ['i32'])
+  ensureHookImport(ctx, 'meta_slot', ['i32'])
   ensureHookImport(ctx, 'xpop_slot', ['i32', 'i32'])
 
   // === Hook metadata ===
@@ -116,6 +117,10 @@ export default (ctx) => {
   ensureHookImport(ctx, 'float_compare', ['i64', 'i64', 'i32'])
   ensureHookImport(ctx, 'float_sum', ['i64', 'i64'])
   ensureHookImport(ctx, 'float_negate', ['i64'])
+  ensureHookImport(ctx, 'float_invert', ['i64'])
+  ensureHookImport(ctx, 'float_mulratio', ['i64', 'i32', 'i32', 'i32'])
+  ensureHookImport(ctx, 'float_sto', ['i32', 'i32', 'i32', 'i32', 'i32', 'i32', 'i64', 'i32'])
+  ensureHookImport(ctx, 'float_sto_set', ['i32', 'i32'])
   ensureHookImport(ctx, 'float_mantissa', ['i64'])
   ensureHookImport(ctx, 'float_sign', ['i64'])
   ensureHookImport(ctx, 'float_int', ['i64', 'i32', 'i32'])
@@ -207,7 +212,7 @@ export default (ctx) => {
   }
 
   // === Emitters for zero-arg functions (return i64) ===
-  for (const fn0 of ['otxn_type', 'otxn_burden', 'etxn_burden', 'hook_pos', 'hook_again',
+  for (const fn0 of ['otxn_type', 'otxn_burden', 'etxn_burden', 'etxn_generation', 'hook_pos', 'hook_again',
                      'ledger_last_time', 'ledger_seq', 'float_one']) {
     ctx.core.emit[`hook.${fn0}`] = () => typed(['call', `$hook_${fn0}`], 'i64')
   }
@@ -233,13 +238,9 @@ export default (ctx) => {
     return typed(['call', '$hook_etxn_nonce', e32(wPtr), e32(wLen)], 'i64')
   }
 
-  // etxn_fee_base(mant: i64) → i64
-  ctx.core.emit['hook.etxn_fee_base'] = (mant) =>
-    typed(['call', '$hook_etxn_fee_base', e64(mant)], 'i64')
-
-  // etxn_manifest(buf: i32, len: i32, master_acc: i32, master_acc_len: i32) → i64
-  ctx.core.emit['hook.etxn_manifest'] = (buf, len, acc, accLen) =>
-    typed(['call', '$hook_etxn_manifest', e32(buf), e32(len), e32(acc), e32(accLen)], 'i64')
+  // etxn_fee_base(tx_buf) → i64
+  ctx.core.emit['hook.etxn_fee_base'] = (txBuf) =>
+    typed(['call', '$hook_etxn_fee_base', ...hookBufArgs(txBuf)], 'i64')
 
   // otxn_slot(slot: i32) → i64
   ctx.core.emit['hook.otxn_slot'] = (slot) =>
@@ -250,8 +251,8 @@ export default (ctx) => {
     typed(['call', '$hook_otxn_id', e32(wPtr), e32(wLen),
       eopt32(flags, ['i32.const', 0])], 'i64')
 
-  // slot_clear, slot_count, slot_size, slot_float (slot: i32) → i64
-  for (const fn1 of ['slot_clear', 'slot_count', 'slot_size', 'slot_float']) {
+  // slot_clear, slot_count, slot_size, slot_float, meta_slot (slot: i32) → i64
+  for (const fn1 of ['slot_clear', 'slot_count', 'slot_size', 'slot_float', 'meta_slot']) {
     ctx.core.emit[`hook.${fn1}`] = (slot) =>
       typed(['call', `$hook_${fn1}`, e32(slot)], 'i64')
   }
@@ -269,7 +270,7 @@ export default (ctx) => {
   ctx.core.emit['hook.float_compare'] = (a, b, mode) =>
     typed(['call', '$hook_float_compare', e64(a), e64(b), eopt32(mode, ['i32.const', 0])], 'i64')
 
-  for (const fn1 of ['float_negate', 'float_mantissa', 'float_sign', 'float_exponent']) {
+  for (const fn1 of ['float_negate', 'float_invert', 'float_mantissa', 'float_sign', 'float_exponent']) {
     ctx.core.emit[`hook.${fn1}`] = (a) => typed(['call', `$hook_${fn1}`, e64(a)], 'i64')
   }
 
@@ -292,6 +293,20 @@ export default (ctx) => {
 
   // float_root(f: i64, n: i32) → i64
   ctx.core.emit['hook.float_root'] = (f, n) => typed(['call', '$hook_float_root', e64(f), e32(n)], 'i64')
+
+  // float_mulratio(f: i64, round_up: i32, numerator: i32, denominator: i32) → i64
+  ctx.core.emit['hook.float_mulratio'] = (f, roundUp, num, denom) =>
+    typed(['call', '$hook_float_mulratio', e64(f), e32(roundUp), e32(num), e32(denom)], 'i64')
+
+  // float_sto(out, currency_buf, issuer_buf, xfl, field_code) → i64
+  ctx.core.emit['hook.float_sto'] = (out, currency, issuer, xfl, fieldCode) =>
+    typed(['call', '$hook_float_sto',
+      ...hookBufArgs(out), ...hookBufArgs(currency), ...hookBufArgs(issuer),
+      e64(xfl), e32(fieldCode)], 'i64')
+
+  // float_sto_set(sto_buf) → i64
+  ctx.core.emit['hook.float_sto_set'] = (buf) =>
+    typed(['call', '$hook_float_sto_set', ...hookBufArgs(buf)], 'i64')
 
   // accept(msg, code) → accept(msg_ptr, msg_len, code_i64)
   ctx.core.emit['hook.accept'] = (msg, code) =>
