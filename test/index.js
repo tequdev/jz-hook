@@ -10,6 +10,7 @@ const TESTS = [
   'data',
   'destruct',
   'closures',
+  'classes',
   'methods',
   'features',
   'feature-gating',
@@ -33,6 +34,8 @@ const TESTS = [
   'perf',
   'timers',
   'test262-regressions',
+  'semantic-invariants',
+  'differential',
 ]
 
 const argFilters = process.argv.slice(2)

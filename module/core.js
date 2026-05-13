@@ -173,16 +173,25 @@ export default (ctx) => {
   } else {
     // Own memory: heap offset in a global, auto-grow when needed
     ctx.scope.globals.set('__heap', '(global $__heap (mut i32) (i32.const 1024))')
+    // Bump allocator with geometric growth. Growing one page at a time turns a
+    // long-running embedding (e.g. watr called thousands of times) into O(n²) —
+    // each memory.grow may relocate and copy the whole heap. So when we must
+    // grow, request at least the current size (≥2× total) in one shot; only on
+    // hitting the declared maximum do we fall back to the bare minimum.
     ctx.core.stdlib['__alloc'] = `(func $__alloc (param $bytes i32) (result i32)
-      (local $ptr i32) (local $next i32)
+      (local $ptr i32) (local $next i32) (local $cur i32) (local $need i32)
       (local.set $ptr (global.get $__heap))
       ;; Align next allocation to 8 bytes
       (local.set $next (i32.and (i32.add (i32.add (local.get $ptr) (local.get $bytes)) (i32.const 7)) (i32.const -8)))
-      ;; Grow memory if needed (each page = 65536 bytes)
-      (if (i32.gt_u (local.get $next) (i32.mul (memory.size) (i32.const 65536)))
-        (then (if (i32.eq (memory.grow
-          (i32.shr_u (i32.add (i32.sub (local.get $next) (i32.mul (memory.size) (i32.const 65536))) (i32.const 65535)) (i32.const 16)))
-          (i32.const -1)) (then (unreachable)))))
+      (local.set $cur (i32.shl (memory.size) (i32.const 16)))
+      (if (i32.gt_u (local.get $next) (local.get $cur))
+        (then
+          (local.set $need (i32.shr_u (i32.add (i32.sub (local.get $next) (local.get $cur)) (i32.const 65535)) (i32.const 16)))
+          (if (i32.lt_u (local.get $need) (memory.size)) (then (local.set $need (memory.size))))
+          (if (i32.eq (memory.grow (local.get $need)) (i32.const -1))
+            (then (if (i32.eq (memory.grow
+              (i32.shr_u (i32.add (i32.sub (local.get $next) (local.get $cur)) (i32.const 65535)) (i32.const 16)))
+              (i32.const -1)) (then (unreachable)))))))
       (global.set $__heap (local.get $next))
       (local.get $ptr))`
     ctx.core.stdlib['__clear'] = `(func $__clear
@@ -404,9 +413,15 @@ export default (ctx) => {
     return ['call', '$__ptr_type', receiver]
   }
 
-  function emitDynGetExprTyped(base, key, vt) {
-    inc('__dyn_get_expr_t')
+  function emitDynGetExprTyped(base, key, vt, prop) {
     const receiver = asI64(base?.type ? base : typed(base, 'f64'))
+    // Constant string key: fold the FNV hash at compile time and call the
+    // prehashed body — no __str_hash on every access.
+    if (typeof prop === 'string') {
+      inc('__dyn_get_expr_t_h')
+      return typed(['f64.reinterpret_i64', ['call', '$__dyn_get_expr_t_h', receiver, key, emitTypeTag(receiver, vt), ['i32.const', strHashLiteral(prop)]]], 'f64')
+    }
+    inc('__dyn_get_expr_t')
     return typed(['f64.reinterpret_i64', ['call', '$__dyn_get_expr_t', receiver, key, emitTypeTag(receiver, vt)]], 'f64')
   }
 
@@ -486,7 +501,7 @@ export default (ctx) => {
     if (typeof obj === 'string') {
       const vt = lookupValType(obj)
       if (usesDynProps(vt)) {
-        return emitDynGetExprTyped(va, key, vt)
+        return emitDynGetExprTyped(va, key, vt, prop)
       }
       if (vt === VAL.HASH) {
         return emitHashGetLocalConst(va, key, prop)
@@ -495,12 +510,12 @@ export default (ctx) => {
       // at off-16 (set by __dyn_set). __hash_get assumes HASH bucket layout
       // and would mis-read OBJECT memory.
       if (vt === VAL.OBJECT) {
-        return emitDynGetExprTyped(va, key, vt)
+        return emitDynGetExprTyped(va, key, vt, prop)
       }
       if (vt == null) {
         // In WASI mode, values are always JSON-derived (never PTR.EXTERNAL host objects).
         // Skip the external branch and dispatch through the typed HASH/OBJECT path.
-        if (ctx.transform.host === 'wasi') return emitDynGetExprTyped(va, key, vt)
+        if (ctx.transform.host === 'wasi') return emitDynGetExprTyped(va, key, vt, prop)
         ctx.features.external = true
         return emitDynGetAnyTyped(va, key, vt)
       }
@@ -598,7 +613,8 @@ export default (ctx) => {
 
     // Module-registered property emitter (.size, etc.)
     const propKey = `.${prop}`
-    if (ctx.core.emit[propKey]) return ctx.core.emit[propKey](obj)
+    const propEmitter = ctx.core.emit[propKey]
+    if (propEmitter && propEmitter.length <= 1) return propEmitter(obj)
 
     return emitPropAccess(emit(obj), obj, prop)
   }
@@ -618,7 +634,7 @@ export default (ctx) => {
         if (typeof obj === 'string') {
           const objType = lookupValType(obj)
           if (usesDynProps(objType)) {
-            access = emitDynGetExprTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), objType)
+            access = emitDynGetExprTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), objType, prop)
           } else if (objType === VAL.HASH) {
             access = emitHashGetLocalConst(['local.get', `$${t}`], asI64(emit(['str', prop])), prop)
           } else if (objType == null) {
@@ -626,7 +642,7 @@ export default (ctx) => {
             // In JS host mode use __dyn_get_any_t but don't force features.external here
             // since ?.prop short-circuits on nullish (EXTERNAL arm is dead unless already on).
             access = ctx.transform.host === 'wasi'
-              ? emitDynGetExprTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), objType)
+              ? emitDynGetExprTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), objType, prop)
               : emitDynGetAnyTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), objType)
           } else {
             inc('__hash_get', '__str_hash', '__str_eq')
@@ -636,12 +652,20 @@ export default (ctx) => {
           if (valTypeOf(obj) === VAL.HASH) {
             access = emitHashGetLocalConst(['local.get', `$${t}`], asI64(emit(['str', prop])), prop)
           } else {
-            access = emitDynGetExprTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), valTypeOf(obj))
+            access = emitDynGetExprTyped(['local.get', `$${t}`], asI64(emit(['str', prop])), valTypeOf(obj), prop)
           }
         }
       }
     }
-    return emitNullishGuarded(['local.tee', `$${t}`, va], access)
+    // Use local.set + local.get (not local.tee inside guard) because isNullish
+    // inlines the null/undefined check as (i32.or (i64.eq X NULL) (i64.eq X UNDEF)),
+    // which duplicates X — a local.tee(block(call $sideEffect)) would run twice.
+    return typed(['block', ['result', 'f64'],
+      ['local.set', `$${t}`, va],
+      ['if', ['result', 'f64'],
+        notNullish(typed(['local.get', `$${t}`], 'f64')),
+        ['then', access],
+        ['else', ['f64.const', `nan:${UNDEF_NAN}`]]]], 'f64')
   }
 
   // Optional index: arr?.[i] → null if arr is null, else arr[i]
@@ -656,7 +680,15 @@ export default (ctx) => {
       if (!ctx.types.typedElem) ctx.types.typedElem = new Map()
       ctx.types.typedElem.set(t, ctx.types.typedElem.get(arr))
     }
-    return emitNullishGuarded(['local.tee', `$${t}`, va], asF64(ctx.core.emit['[]'](t, idx)))
+    // Use local.set + local.get (not local.tee inside guard) because isNullish
+    // inlines the null/undefined check as (i32.or (i64.eq X NULL) (i64.eq X UNDEF)),
+    // which duplicates X — a local.tee(block(call $sideEffect)) would run twice.
+    return typed(['block', ['result', 'f64'],
+      ['local.set', `$${t}`, va],
+      ['if', ['result', 'f64'],
+        notNullish(typed(['local.get', `$${t}`], 'f64')),
+        ['then', asF64(ctx.core.emit['[]'](t, idx))],
+        ['else', ['f64.const', `nan:${UNDEF_NAN}`]]]], 'f64')
   }
 
   // Optional call: fn?.(...args) → null if fn is null, else call fn
@@ -674,7 +706,14 @@ export default (ctx) => {
         const vt = typeof recv === 'string' ? repOf(recv)?.val : valTypeOf(recv)
         if (vt) updateRep(t, { val: vt })
         const callResult = methodEmit(t, ...args)
-        return emitNullishGuarded(['local.tee', `$${t}`, va], asF64(callResult))
+        // Use local.set + local.get (not local.tee inside guard) because isNullish
+        // inlines the null/undefined check which duplicates the expression.
+        return typed(['block', ['result', 'f64'],
+          ['local.set', `$${t}`, va],
+          ['if', ['result', 'f64'],
+            notNullish(typed(['local.get', `$${t}`], 'f64')),
+            ['then', asF64(callResult)],
+            ['else', ['f64.const', `nan:${UNDEF_NAN}`]]]], 'f64')
       }
     }
     const t = temp()
@@ -682,7 +721,14 @@ export default (ctx) => {
     // If nullish → return NULL_NAN, else call via fn.call
     if (!ctx.closure.call) err('Optional call requires fn module')
     const callResult = ctx.closure.call(typed(['local.get', `$${t}`], 'f64'), args)
-    return emitNullishGuarded(['local.tee', `$${t}`, va], asF64(callResult))
+    // Use local.set + local.get (not local.tee inside guard) because isNullish
+    // inlines the null/undefined check which duplicates the expression.
+    return typed(['block', ['result', 'f64'],
+      ['local.set', `$${t}`, va],
+      ['if', ['result', 'f64'],
+        notNullish(typed(['local.get', `$${t}`], 'f64')),
+        ['then', asF64(callResult)],
+        ['else', ['f64.const', `nan:${UNDEF_NAN}`]]]], 'f64')
   }
 
   // typeof: returns JS-style string. Reachable results are number/undefined/string/function/symbol/object

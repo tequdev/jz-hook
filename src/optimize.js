@@ -45,9 +45,17 @@ const UNDEF_BITS = '0x' + (LAYOUT.NAN_PREFIX_BITS | (2n << BigInt(LAYOUT.AUX_SHI
  *   0 — nothing. Fastest compile, largest output. Useful for live coding.
  *   1 — encoding-compactness only (treeshake + sortLocalsByUse + fusedRewrite-inline).
  *       Cheap, no IR rewrites that perturb V8's tier-up shape.
- *   2 — default. Stable passes (watr CSE/DCE/inline + every jz pass that has
- *       benchmark proof).
+ *   2 — default. Stable jz passes (every pass with benchmark proof). watr disabled
+ *       by default — adds ~2s compile time for identical runtime performance.
  *   3 — aggressive experimental passes in addition to level 2.
+ *
+ * String aliases (the size↔speed tradeoff lives entirely in the unroll/scalar
+ * knobs, so the aliases just dial those):
+ *   'size'     — level 2 with loop/const unroll + lane vectorization off and tight
+ *                scalar-replacement caps. Smallest wasm; still fully optimized.
+ *   'balanced' — the default (= level 2).
+ *   'speed'    — level 2 with full nested unroll + lane vectorization on (= level 3
+ *                minus the heavy third-party watr pass).
  */
 export const PASS_NAMES = [
   'watr',                     // third-party WAT-level CSE/DCE/inlining (heaviest)
@@ -59,6 +67,9 @@ export const PASS_NAMES = [
   'hoistInvariantCellLoads',
   'cseScalarLoad',
   'csePureExpr',
+  'dropDeadZeroInit',
+  'deadStoreElim',
+  'promoteGlobals',          // read-only global.get → local for multi-read globals
   'sortLocalsByUse',
   'specializeMkptr',
   'specializePtrBase',
@@ -77,8 +88,16 @@ const ALL_OFF = Object.freeze(Object.fromEntries(PASS_NAMES.map(n => [n, false])
 const LEVEL_PRESETS = Object.freeze({
   0: ALL_OFF,
   1: Object.freeze({ ...ALL_OFF, treeshake: true, sortLocalsByUse: true, fusedRewrite: true }),
-  2: Object.freeze({ ...ALL_ON, nestedSmallConstForUnroll: 'auto' }),
+  2: Object.freeze({ ...ALL_ON, watr: false, nestedSmallConstForUnroll: 'auto' }),
   3: ALL_ON,
+  // Named aliases — dial the size↔speed knobs on top of the level-2 base.
+  balanced: Object.freeze({ ...ALL_ON, watr: false, nestedSmallConstForUnroll: 'auto' }),
+  size: Object.freeze({
+    ...ALL_ON, watr: false,
+    smallConstForUnroll: false, nestedSmallConstForUnroll: false, vectorizeLaneLocal: false,
+    scalarTypedLoopUnroll: 4, scalarTypedNestedUnroll: 8, scalarTypedArrayLen: 8,
+  }),
+  speed: Object.freeze({ ...ALL_ON, watr: false }),
 })
 
 /**
@@ -87,15 +106,17 @@ const LEVEL_PRESETS = Object.freeze({
  *   resolveOptimize(undefined | true)         → level 2 stable defaults
  *   resolveOptimize(false | 0)                → all off
  *   resolveOptimize(1 | 2 | 3)                → preset for that level
+ *   resolveOptimize('size' | 'speed' | 'balanced') → named alias preset
  *   resolveOptimize({ level: 1, watr: true }) → level 1 base, with watr forced on
+ *   resolveOptimize({ level: 'size', vectorizeLaneLocal: true }) → 'size' base, override
  *   resolveOptimize({ hoistAddrBase: false }) → level 2 base, hoistAddrBase off
  */
 export function resolveOptimize(opt) {
   if (opt === false || opt === 0) return { ...ALL_OFF }
   if (opt === true || opt == null) return { ...LEVEL_PRESETS[2] }
-  if (typeof opt === 'number') return { ...(LEVEL_PRESETS[opt] || ALL_ON) }
+  if (typeof opt === 'number' || typeof opt === 'string') return { ...(LEVEL_PRESETS[opt] || LEVEL_PRESETS[2]) }
   if (typeof opt === 'object') {
-    const baseLevel = typeof opt.level === 'number' ? opt.level : 2
+    const baseLevel = typeof opt.level === 'number' || typeof opt.level === 'string' ? opt.level : 2
     const base = LEVEL_PRESETS[baseLevel] || ALL_ON
     const out = { ...base }
     for (const n of PASS_NAMES) if (n in opt) out[n] = n === 'nestedSmallConstForUnroll' && opt[n] === 'auto' ? 'auto' : !!opt[n]
@@ -1026,14 +1047,23 @@ export function csePureExpr(fn) {
   while (fn.some(n => Array.isArray(n) && n[0] === 'local' && n[1] === `$__pe${snapId}`)) snapId++
   const newLocals = []
 
-  const COMMUTATIVE = new Set(['f64.mul', 'f64.add'])
-  const TARGET_OPS = new Set(['f64.mul', 'f64.add', 'f64.sub'])
+  const COMMUTATIVE = new Set(['f64.mul', 'f64.add', 'i32.mul', 'i32.add', 'i32.and', 'i32.or', 'i32.xor', 'i64.mul', 'i64.add', 'i64.and', 'i64.or', 'i64.xor'])
+  const TARGET_OPS = new Set([
+    'f64.mul', 'f64.add', 'f64.sub',
+    'i32.mul', 'i32.add', 'i32.sub', 'i32.shl', 'i32.shr_u', 'i32.shr_s', 'i32.and', 'i32.or', 'i32.xor',
+    'i64.mul', 'i64.add', 'i64.sub', 'i64.shl', 'i64.shr_u', 'i64.shr_s', 'i64.and', 'i64.or', 'i64.xor',
+  ])
+  const OP_TYPE = {
+    'f64.mul': 'f64', 'f64.add': 'f64', 'f64.sub': 'f64',
+    'i32.mul': 'i32', 'i32.add': 'i32', 'i32.sub': 'i32', 'i32.shl': 'i32', 'i32.shr_u': 'i32', 'i32.shr_s': 'i32', 'i32.and': 'i32', 'i32.or': 'i32', 'i32.xor': 'i32',
+    'i64.mul': 'i64', 'i64.add': 'i64', 'i64.sub': 'i64', 'i64.shl': 'i64', 'i64.shr_u': 'i64', 'i64.shr_s': 'i64', 'i64.and': 'i64', 'i64.or': 'i64', 'i64.xor': 'i64',
+  }
 
   // Encode a leaf operand to a stable string key. Returns null if not pure-leaf.
   const leafKey = (n) => {
     if (!Array.isArray(n)) return null
     if (n[0] === 'local.get' && typeof n[1] === 'string') return `L:${n[1]}`
-    if (n[0] === 'f64.const') return `C:${n[1]}`
+    if (n[0] === 'f64.const' || n[0] === 'i32.const' || n[0] === 'i64.const' || n[0] === 'f32.const') return `C:${n[0]}:${n[1]}`
     return null
   }
 
@@ -1094,7 +1124,7 @@ export function csePureExpr(fn) {
           if (!entry.snapName) {
             const snapName = `$__pe${snapId++}`
             entry.snapName = snapName
-            newLocals.push(['local', snapName, 'f64'])
+            newLocals.push(['local', snapName, OP_TYPE[op] || 'f64'])
             const orig = entry.anchorParent[entry.anchorIdx]
             entry.anchorParent[entry.anchorIdx] = ['local.tee', snapName, orig]
           }
@@ -1119,7 +1149,321 @@ export function csePureExpr(fn) {
   if (newLocals.length) fn.splice(bodyStart, 0, ...newLocals)
 }
 
+/**
+ * Drop redundant zero-initialisation of fresh function-scope locals.
+ *
+ * WASM zero-initialises every local on entry (0 / 0.0 / null). jz lowers source
+ * `let x = 0` to `(local $x …)` + `(local.set $x (<zero const>))` at the top of
+ * the function body — the explicit set is a no-op when nothing has touched `$x`
+ * yet. `wasm-opt -Oz` elides these; do the same so jz's own output is minimal.
+ *
+ * Only removes a `(local.set $L (i32|i64|f64|f32.const 0))` when:
+ *   - `$L` is a non-param local (a param's "default" is the incoming arg, not 0),
+ *   - it is a *top-level* body statement (never descend into block/loop/if — a
+ *     nested zero-set inside a loop genuinely re-initialises across iterations),
+ *   - `$L` has not been referenced by any earlier top-level statement (so the
+ *     local still holds its entry-time zero at this point),
+ *   - `$L` is read (`local.get`) somewhere in the function (otherwise leave the
+ *     store for deadStoreElim and avoid orphaning the `(local $L …)` decl),
+ *   - the constant is +0 / +0.0 (a `-0.0` f64 set is *not* redundant — locals
+ *     default to +0.0, which differs in bits from -0.0).
+ */
+export function dropDeadZeroInit(fn) {
+  if (!Array.isArray(fn) || fn[0] !== 'func') return
+  const bodyStart = findBodyStart(fn)
+  if (bodyStart < 0) return
 
+  const seen = new Set()           // params + locals referenced by an earlier stmt
+  const reads = new Set()          // locals read by `local.get` anywhere
+  for (const c of fn) if (Array.isArray(c) && c[0] === 'param' && typeof c[1] === 'string') seen.add(c[1])
+
+  const collectGets = (node) => {
+    if (!Array.isArray(node)) return
+    if (node[0] === 'local.get' && typeof node[1] === 'string') reads.add(node[1])
+    for (let i = 1; i < node.length; i++) collectGets(node[i])
+  }
+  for (let i = bodyStart; i < fn.length; i++) collectGets(fn[i])
+
+  const collectRefs = (node) => {
+    if (!Array.isArray(node)) return
+    const op = node[0]
+    if ((op === 'local.get' || op === 'local.set' || op === 'local.tee') && typeof node[1] === 'string') seen.add(node[1])
+    for (let i = 1; i < node.length; i++) collectRefs(node[i])
+  }
+  const isPlusZeroConst = (e) => {
+    if (!Array.isArray(e) || e.length !== 2) return false
+    if (e[0] !== 'i32.const' && e[0] !== 'i64.const' && e[0] !== 'f64.const' && e[0] !== 'f32.const') return false
+    const v = e[1]
+    if (typeof v === 'bigint') return v === 0n
+    if (typeof v === 'number') return v === 0 && !Object.is(v, -0)
+    if (typeof v === 'string') { const t = v.trim(); return t === '0' || t === '0.0' || t === '+0' || t === '+0.0' }
+    return false
+  }
+
+  const drop = []
+  for (let i = bodyStart; i < fn.length; i++) {
+    const node = fn[i]
+    if (!Array.isArray(node)) continue
+    if (node[0] === 'local.set' && node.length === 3 && typeof node[1] === 'string' &&
+        !seen.has(node[1]) && reads.has(node[1]) && isPlusZeroConst(node[2])) {
+      drop.push(i)
+      seen.add(node[1])
+      continue
+    }
+    collectRefs(node)
+  }
+  for (let i = drop.length - 1; i >= 0; i--) fn.splice(drop[i], 1)
+}
+
+/**
+ * Dead-store elimination: remove `local.set` / `local.tee` and `drop` of pure
+ * expressions whose values are never consumed.
+ *
+ * Conservative single-block analysis: tracks last-write per local within each
+ * straight-line sequence. A write is dead if the same local is written again
+ * before any intervening read in the same block. Control-flow boundaries
+ * (block, loop, if) reset the table — we don't eliminate across branches.
+ *
+ * Also removes `drop` of pure expressions (e.g. leftover ptr-type calls).
+ */
+export function deadStoreElim(fn) {
+  if (!Array.isArray(fn) || fn[0] !== 'func') return
+  const bodyStart = findBodyStart(fn)
+  if (bodyStart < 0) return
+
+  const dead = []
+
+  const collectGets = (node, out) => {
+    if (!Array.isArray(node)) return
+    if (node[0] === 'local.get' && typeof node[1] === 'string') { out.add(node[1]); return }
+    for (let i = 1; i < node.length; i++) collectGets(node[i], out)
+  }
+
+  const isPure = (node) => {
+    if (!Array.isArray(node)) return true
+    const op = node[0]
+    if (typeof op === 'string' && MEMOP.test(op)) return false
+    if (op === 'call' || op === 'call_indirect' || op === 'call_ref') return false
+    if (op === 'global.get' || op === 'global.set') return false
+    if (op === 'local.tee') return false
+    if (op === 'memory.size' || op === 'memory.grow') return false
+    for (let i = 1; i < node.length; i++) if (!isPure(node[i])) return false
+    return true
+  }
+
+  const scanBlock = (items, start, end) => {
+    const lastWrite = new Map() // localName → { parent, idx }
+
+    for (let i = start; i < end; i++) {
+      const node = items[i]
+      if (!Array.isArray(node)) continue
+      const op = node[0]
+
+      // Reads invalidate pending dead writes
+      const reads = new Set()
+      collectGets(node, reads)
+      if (op === 'local.tee') reads.delete(node[1])
+      for (const name of reads) lastWrite.delete(name)
+
+      // Drop of pure expr → dead
+      if (op === 'drop' && isPure(node[1])) {
+        dead.push({ parent: items, idx: i, drop: true })
+      }
+
+      // Local write tracking
+      if ((op === 'local.set' || op === 'local.tee') && typeof node[1] === 'string') {
+        const prev = lastWrite.get(node[1])
+        if (prev) {
+          // The store-to-local is dead, but a `local.set` is only *removable*
+          // if its RHS is pure — `local.set $x (call f …)` where `f` mutates
+          // memory must still run. (A `local.tee` is always safe: removal demotes
+          // it to its value expression, so any side effects there are preserved.)
+          const pn = prev.parent[prev.idx]
+          if (pn[0] === 'local.tee' || isPure(pn[2])) dead.push(prev)
+        }
+        lastWrite.set(node[1], { parent: items, idx: i })
+      }
+
+      // Recurse into nested blocks with fresh state
+      if (op === 'block' || op === 'loop') {
+        let j = 1
+        while (j < node.length && Array.isArray(node[j]) && node[j][0] === 'result') j++
+        scanBlock(node, j, node.length)
+      } else if (op === 'if') {
+        let j = 1
+        while (j < node.length && Array.isArray(node[j]) && node[j][0] === 'result') j++
+        const condReads = new Set()
+        collectGets(node[j], condReads)
+        for (const name of condReads) lastWrite.delete(name)
+        j++
+        for (; j < node.length; j++) {
+          const c = node[j]
+          if (Array.isArray(c) && (c[0] === 'then' || c[0] === 'else')) scanBlock(c, 1, c.length)
+        }
+      }
+    }
+  }
+
+  scanBlock(fn, bodyStart, fn.length)
+
+  // Remove in reverse order so indices stay valid
+  for (let i = dead.length - 1; i >= 0; i--) {
+    const d = dead[i]
+    if (d.drop) {
+      d.parent.splice(d.idx, 1)
+    } else {
+      const node = d.parent[d.idx]
+      if (node[0] === 'local.tee') {
+        // tee in statement position: replace with just the value (implicitly dropped)
+        d.parent[d.idx] = node[2]
+      } else {
+        // set in statement position: remove entirely
+        d.parent.splice(d.idx, 1)
+      }
+    }
+  }
+}
+
+/**
+ * Promote read-only globals to locals within each function.
+ *
+ * When a global is only read (never written) within a function and read ≥ 2 times,
+ * load it once at function entry into a fresh local and replace all global.get with local.get.
+ *
+ * This eliminates repeated global.get instructions (5 bytes each with LEB128 idx) in
+ * favour of cheaper local.get (1–2 bytes), and helps V8's TurboFan by reducing the
+ * number of load-from-global operations it must track.
+ *
+ * Only promotes globals that appear read-only in the function body. Globals that are
+ * also written (global.set) are left untouched — the promotion would be unsound if
+ * the global changes between reads.
+ *
+ * @param {Array} fn - Function IR (WAT-as-array)
+ * @param {Map<string,string>} [globalTypes] - Optional: global name → wasm type ('i32'|'f64'|'i64'|'funcref')
+ */
+export function promoteGlobals(fn, globalTypes) {
+  if (!Array.isArray(fn) || fn[0] !== 'func') return
+  const bodyStart = findBodyStart(fn)
+  if (bodyStart < 0) return
+
+  // Collect global.get counts and detect any global.set
+  const getCounts = new Map()  // globalName → count
+  const written = new Set()
+
+  const scan = (node) => {
+    if (!Array.isArray(node)) return
+    const op = node[0]
+    if (op === 'global.get' && typeof node[1] === 'string') {
+      getCounts.set(node[1], (getCounts.get(node[1]) || 0) + 1)
+      return  // don't recurse into the name string
+    }
+    if (op === 'global.set') {
+      if (typeof node[1] === 'string') written.add(node[1])
+      if (node[2]) scan(node[2])
+      return
+    }
+    for (let i = 1; i < node.length; i++) scan(node[i])
+  }
+
+  for (let i = bodyStart; i < fn.length; i++) scan(fn[i])
+
+  // Build replacement map: globalName → { localName, type } for globals read ≥ 3 times, not written.
+  // Threshold 3 avoids size regressions in tiny functions where local setup cost dominates.
+  // Find the highest existing $_pg index to avoid duplicate local names on re-runs.
+  let localIdx = 0
+  for (let i = 2; i < bodyStart; i++) {
+    const c = fn[i]
+    if (Array.isArray(c) && c[0] === 'local' && typeof c[1] === 'string') {
+      const m = c[1].match(/^\$_pg(\d+)$/)
+      if (m) localIdx = Math.max(localIdx, parseInt(m[1], 10) + 1)
+    }
+  }
+  const replacements = new Map()
+  for (const [gName, count] of getCounts) {
+    if (count < 3 || written.has(gName)) continue
+    // Determine type: use provided map, or infer from context
+    const type = globalTypes?.get(gName) || inferTypeFromContext(fn, gName, bodyStart)
+    if (!type) continue  // can't determine type, skip
+    const lName = `$_pg${localIdx++}`
+    replacements.set(gName, { lName, type })
+  }
+  if (!replacements.size) return
+
+  // Inject local declarations for promoted globals
+  for (const [, { lName, type }] of replacements) {
+    fn.splice(bodyStart, 0, ['local', lName, type])
+  }
+  // After all splices, bodyStart has shifted
+  const newBodyStart = bodyStart + replacements.size
+
+  // Insert local.set at the very start of the body (after the new locals)
+  let insertIdx = newBodyStart
+  for (const [gName, { lName }] of replacements) {
+    fn.splice(insertIdx, 0, ['local.set', lName, ['global.get', gName]])
+    insertIdx++
+  }
+
+  // Replace all global.get with local.get (only for promoted globals)
+  const replace = (node) => {
+    if (!Array.isArray(node)) return
+    const op = node[0]
+    if (op === 'global.get' && typeof node[1] === 'string') {
+      const info = replacements.get(node[1])
+      if (info) { node[0] = 'local.get'; node[1] = info.lName }
+      return
+    }
+    for (let i = 1; i < node.length; i++) replace(node[i])
+  }
+  for (let i = insertIdx; i < fn.length; i++) replace(fn[i])
+}
+
+/**
+ * Infer a global's type from its first usage context within a function body.
+ * Looks at how the global.get result is consumed:
+ *   - wrapped in i32.wrap_i64 → global is i64 (but jz doesn't use i64 globals)
+ *   - used as arg to i32 ops (i32.add, i32.store, etc.) → i32
+ *   - stored to i32-typed local → i32
+ *   - otherwise → f64 (default for NaN-boxing scheme)
+ */
+function inferTypeFromContext(fn, gName, bodyStart) {
+  let inferred = null
+  const check = (node, parent, idx) => {
+    if (!Array.isArray(node) || inferred) return
+    if (node[0] === 'global.get' && node[1] === gName) {
+      // Check parent context
+      if (Array.isArray(parent)) {
+        const pOp = parent[0]
+        // If parent is an i32 op that takes this as operand, likely i32
+        if (typeof pOp === 'string') {
+          if (pOp.startsWith('i32.') && pOp !== 'i32.wrap_i64' && pOp !== 'i32.trunc_f64') {
+            inferred = 'i32'
+            return
+          }
+          if (pOp === 'i32.store' && idx === 2) { inferred = 'i32'; return }  // addr
+          if (pOp === 'f64.store' && idx === 2) { inferred = 'f64'; return }  // addr can be i32, but value is f64
+          if (pOp === 'i32.eq' || pOp === 'i32.ne' || pOp === 'i32.lt_s' || pOp === 'i32.lt_u' ||
+              pOp === 'i32.gt_s' || pOp === 'i32.gt_u' || pOp === 'i32.le_s' || pOp === 'i32.le_u' ||
+              pOp === 'i32.ge_s' || pOp === 'i32.ge_u') {
+            // Comparison — could be i32, but in jz NaN-boxing scheme most globals are f64
+            // Only if we can confirm from local.set context
+          }
+          if (pOp === 'local.set' && idx === 0) {
+            // Can't determine local type from here easily
+          }
+        }
+      }
+      // Default: f64 (the NaN-boxing carrier)
+      if (!inferred) inferred = 'f64'
+      return
+    }
+    for (let i = 0; i < node.length; i++) {
+      if (Array.isArray(node[i])) check(node[i], node, i)
+      if (inferred) return
+    }
+  }
+  for (let i = bodyStart; i < fn.length && !inferred; i++) check(fn[i], null, i)
+  return inferred
+}
 
 /**
  * Hoist frequently-repeated f64 constants into mutable globals.
@@ -1461,12 +1805,20 @@ export function sortStrPoolByFreq(funcs, strPoolRef, strDedupMap) {
   // Sort by freq descending; tie-break by length ascending (pack short hot strings into low-offset range).
   entries.sort((a, b) => (freq.get(b.oldOff) || 0) - (freq.get(a.oldOff) || 0) || a.len - b.len)
 
-  // Rebuild pool; map old → new offsets.
+  // Rebuild pool; map old → new offsets. Deduplicate identical strings — keep the
+  // first (hottest) occurrence as canonical and point duplicates to it.
   const remap = new Map()
+  const canon = new Map() // str content → new offset
   let newPool = ''
   for (const e of entries) {
+    const existing = canon.get(e.str)
+    if (existing !== undefined) {
+      remap.set(e.oldOff, existing)
+      continue
+    }
     newPool += String.fromCharCode(e.len & 0xFF, (e.len >> 8) & 0xFF, (e.len >> 16) & 0xFF, (e.len >> 24) & 0xFF)
     remap.set(e.oldOff, newPool.length)
+    canon.set(e.str, newPool.length)
     newPool += e.str
   }
   strPoolRef.pool = newPool
@@ -1495,7 +1847,7 @@ export function sortStrPoolByFreq(funcs, strPoolRef, strDedupMap) {
  * @param fn  func IR node
  * @param cfg optional resolved config from resolveOptimize() — when omitted, all on.
  */
-export function optimizeFunc(fn, cfg) {
+export function optimizeFunc(fn, cfg, globalTypes) {
   if (cfg && cfg.hoistPtrType === false &&
       cfg.hoistInvariantPtrOffset === false &&
       cfg.hoistInvariantPtrOffsetLoop === false &&
@@ -1504,6 +1856,9 @@ export function optimizeFunc(fn, cfg) {
       cfg.hoistInvariantCellLoads === false &&
       cfg.cseScalarLoad === false &&
       cfg.csePureExpr === false &&
+      cfg.dropDeadZeroInit === false &&
+      cfg.deadStoreElim === false &&
+      cfg.promoteGlobals === false &&
       cfg.sortLocalsByUse === false &&
       cfg.vectorizeLaneLocal === false) return
   if (!cfg || cfg.hoistPtrType !== false) hoistPtrType(fn)
@@ -1515,11 +1870,15 @@ export function optimizeFunc(fn, cfg) {
   if (!cfg || cfg.hoistInvariantCellLoads !== false) hoistInvariantCellLoads(fn)
   if (!cfg || cfg.cseScalarLoad !== false) cseScalarLoad(fn)
   if (!cfg || cfg.csePureExpr !== false) csePureExpr(fn)
-  // Vectorizer runs only in the POST-watr phase (`__phase === 'post'`), where
-  // narrow.js + watr have produced the canonical lane-local shape. Running it
-  // pre-watr matches a noisier IR and would re-fire post-watr on the residual
-  // tail — producing nested SIMD blocks. Single-pass via phase gating.
-  if (cfg && cfg.vectorizeLaneLocal === true && cfg.__phase === 'post' && cfg.__host !== 'hook') vectorizeLaneLocal(fn)
+  if (!cfg || cfg.dropDeadZeroInit !== false) dropDeadZeroInit(fn)
+  if (!cfg || cfg.deadStoreElim !== false) deadStoreElim(fn)
+  if (!cfg || cfg.promoteGlobals !== false) promoteGlobals(fn, globalTypes)
+  // Vectorizer runs in POST-watr when watr is enabled, or in PRE when watr is
+  // disabled (there is no post pass then). Hook mode disables SIMD entirely.
+  if (cfg && cfg.vectorizeLaneLocal === true) {
+    const runVectorizer = cfg.__phase === 'post' || (cfg.__phase !== 'post' && cfg.watr === false)
+    if (runVectorizer && cfg.__host !== 'hook') vectorizeLaneLocal(fn)
+  }
   if (!cfg || cfg.sortLocalsByUse !== false) sortLocalsByUse(fn, cfg && cfg.fusedRewrite !== false ? counts : null)
 }
 
@@ -1649,6 +2008,30 @@ function walkRewrite(node, doInline, counts) {
         const out = ['i32.load']
         for (let i = 1; i < inner.length; i++) out.push(inner[i])
         return out
+      }
+      // (i32.wrap_i64 (i64.reinterpret_f64 (call $__mkptr* … offset))) → offset.
+      // A NaN-boxed pointer keeps type/aux in the high bits and the i32 offset in
+      // the low 32, so the round-trip through f64 is pure overhead whenever the
+      // consumer only wants the offset (typical when the pointer feeds an unboxed
+      // i32 local). Covers the generic 3-arg `$__mkptr` and the specialized
+      // single-arg `$__mkptr_T_A_d` trampolines alike — offset is the last arg.
+      const isMkptr = n => Array.isArray(n) && n[0] === 'call' && typeof n[1] === 'string'
+        && (n[1] === '$__mkptr' || n[1].startsWith('$__mkptr_'))
+      if (isMkptr(inner)) return inner[inner.length - 1]
+      // …and reach through a `(block (result f64) …stmts (call $__mkptr …))` —
+      // `new TypedArray(n)` lowers to exactly this shape — by retyping the block
+      // to i32 and dropping the box on its tail.
+      if (Array.isArray(inner) && inner[0] === 'block' && isMkptr(inner[inner.length - 1])) {
+        let ri = -1
+        for (let i = 1; i <= 2 && i < inner.length; i++)
+          if (Array.isArray(inner[i]) && inner[i][0] === 'result') { ri = i; break }
+        if (ri >= 0 && inner[ri][1] === 'f64') {
+          const tail = inner[inner.length - 1]
+          const nb = inner.slice()
+          nb[ri] = ['result', 'i32']
+          nb[nb.length - 1] = tail[tail.length - 1]
+          return nb
+        }
       }
     }
     if (Array.isArray(a) && a[0] === 'i64.or' && a.length === 3) {
@@ -1806,6 +2189,36 @@ export function treeshake(funcSections, allModuleNodes, opts) {
       }
     }
   }
+
+  // Dead-global elimination: after dead funcs are gone, drop `(global $g …)` decls
+  // that nothing references (a `global.get`/`global.set` in a remaining func, a kept
+  // global's init expr, a data/elem offset, or an `(export … (global $g))`). Imported
+  // globals live in `allModuleNodes`, not in `opts.globals`, so they're never touched.
+  // Fixpoint: a kept global's init may reference another global.
+  const globals = removeDead && opts && Array.isArray(opts.globals) ? opts.globals : null
+  if (globals) {
+    const collectGlobalRefs = (node, refd) => {
+      if (!Array.isArray(node)) return
+      if ((node[0] === 'global.get' || node[0] === 'global.set') && typeof node[1] === 'string') refd.add(node[1])
+      else if (node[0] === 'export' && Array.isArray(node[2]) && node[2][0] === 'global' && typeof node[2][1] === 'string') refd.add(node[2][1])
+      for (const c of node) collectGlobalRefs(c, refd)
+    }
+    let changed = true
+    while (changed) {
+      changed = false
+      const refd = new Set()
+      for (const { arr } of funcSections) for (const n of arr) collectGlobalRefs(n, refd)
+      for (const n of allModuleNodes) collectGlobalRefs(n, refd)
+      for (const g of globals) collectGlobalRefs(g, refd)
+      for (let i = globals.length - 1; i >= 0; i--) {
+        const g = globals[i]
+        if (Array.isArray(g) && g[0] === 'global' && typeof g[1] === 'string' && !refd.has(g[1])) {
+          globals.splice(i, 1); changed = true
+        }
+      }
+    }
+  }
+
   return { removed, callCount }
 }
 

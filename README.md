@@ -51,6 +51,9 @@ jz-hook --host hook --validate hook.js -o hook.wasm
 | `--namespace <hex>` | `sfHookNamespace` (32-byte hex) |
 | `--max-iter <n>` | Default loop guard iteration cap (default: 65535) |
 | `--validate` | Verify output WASM meets Hook constraints |
+| `-O<n>`, `--optimize <n>` | Optimization level or alias (`size`, `balanced`, `speed`) |
+| `--no-alloc` | Omit `_alloc`/`_clear` allocator exports for standalone WASM |
+| `--names` | Emit a WASM `name` section for profiling/debugging |
 
 ## Hook Language
 
@@ -148,6 +151,7 @@ The `--max-iter <n>` flag sets the cap for dynamically-bounded loops (default 65
 ## Upstream / Fork
 
 This is a fork of [jz](https://github.com/dy/jz) by Dmitry Iv. Existing `host:'js'` and `host:'wasi'` modes are fully preserved. Hook-specific code lives in:
+
 - `src/guard.js` — guard insertion pass
 - `src/hook-validate.js` — constraint checker
 - `module/hook/` — Hook API bindings

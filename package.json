@@ -25,8 +25,11 @@
     "test262": "node test/test262.js",
     "test262:builtins": "node test/test262-builtins.js",
     "bench": "node bench/bench.mjs",
+    "bench:size": "node scripts/bench-size.mjs",
     "bench:compile": "node scripts/bench-compile.mjs",
-    "test:bench-pin": "node test/bench-pin.js"
+    "test:bench-pin": "node test/bench-pin.js",
+    "test:all": "npm test && npm run test:bench-pin",
+    "prepublishOnly": "npm run test:all"
   },
   "repository": {
     "type": "git",
@@ -39,8 +42,8 @@
   "author": "Dmitry Iv",
   "license": "MIT",
   "dependencies": {
-    "subscript": "^10.4.2",
-    "watr": "^4.5.1"
+    "subscript": "^10.4.7",
+    "watr": "^4.5.3"
   },
   "keywords": [
     "javascript",

@@ -45,24 +45,18 @@ import prepare, { GLOBALS } from './src/prepare.js'
 import compile from './src/compile.js'
 import { emitter } from './src/emit.js'
 import { optimizeFunc, resolveOptimize } from './src/optimize.js'
+import { detectOptimizeConfig } from './src/auto-config.js'
 import jzify from './src/jzify.js'
 import {
   memory as enhanceMemory, instantiate as instantiateRuntime,
 } from './src/host.js'
 import { validateHook } from './src/hook-validate.js'
 
-const importSpecMayReturnExternal = (spec) => {
-  if (typeof spec === 'function') return true
-  return false
-}
-
-const importsMayReturnExternal = (imports) => {
-  if (!imports) return false
-  for (const mod of Object.values(imports))
-    for (const spec of Object.values(mod || {}))
-      if (importSpecMayReturnExternal(spec)) return true
-  return false
-}
+// A host import that's a JS function may hand back any value, including a host
+// object — which arrives in wasm as a PTR.EXTERNAL ref. Constants/typed specs can't.
+const importsMayReturnExternal = (imports) =>
+  !!imports && Object.values(imports).some(mod =>
+    Object.values(mod || {}).some(spec => typeof spec === 'function'))
 
 const nowMs = () => globalThis.performance?.now ? globalThis.performance.now() : Date.now()
 
@@ -237,6 +231,21 @@ jz.compile = (code, opts = {}) => {
   let parsed = time('parse', () => parse(code))
   if (opts.jzify) parsed = time('jzify', () => jzify(parsed))
   const ast = time('prepare', () => prepare(parsed))
+
+  // Auto-detect optimization tuning from source characteristics when the user
+  // hasn't provided any optimize option. At the default level its only *live*
+  // output is the typed-array scalarization thresholds (every other override —
+  // watr off, sortStrPool/hoistPtr on — already matches the level-2 preset), so
+  // skip the AST scan entirely unless the program touches typed arrays.
+  // NOTE: if the level-2 default ever flips watr on, drop this guard so the
+  // machine-generated-code heuristic in detectOptimizeConfig can take effect.
+  if (opts.optimize == null && ctx.module.modules.typedarray) {
+    const autoCfg = detectOptimizeConfig(ast, code)
+    if (Object.keys(autoCfg).length) {
+      ctx.transform.optimize = resolveOptimize(autoCfg)
+    }
+  }
+
   const module = time('compile', () => compile(ast, profiler))
 
   // host: 'wasi' — error if the wasm would import any env.__ext_* helper. Those exist
@@ -272,8 +281,10 @@ jz.compile = (code, opts = {}) => {
   // Only valuable to re-run when watr ran (watr is what re-introduces the boundaries).
   if (cfg.watr) {
     const postCfg = { ...cfg, __phase: 'post' }
+    // Build global name→type map from ctx.scope.globalTypes for promoteGlobals
+    const globalTypesMap = ctx.scope.globalTypes ? new Map([...ctx.scope.globalTypes].map(([k, v]) => [`$${k}`, v])) : null
     time('watrReopt', () => {
-      for (const node of optimized) if (Array.isArray(node) && node[0] === 'func') optimizeFunc(node, postCfg)
+      for (const node of optimized) if (Array.isArray(node) && node[0] === 'func') optimizeFunc(node, postCfg, globalTypesMap)
     })
   }
   if (opts.wat) return time('watrPrint', () => watrPrint(optimized))

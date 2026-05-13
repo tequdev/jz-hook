@@ -44,6 +44,16 @@ function numConstLiteral(expr) {
 const sameValueZeroEq = '(call $__same_value_zero (i64.load (i32.add (local.get $slot) (i32.const 8))) (local.get $key))'
 const strEq = '(call $__str_eq (i64.load (i32.add (local.get $slot) (i32.const 8))) (local.get $key))'
 
+// Open-addressing probe walked additively by entrySize: avoids an i32.mul + mask per
+// step (vs recomputing slot = off + idx*entrySize). Needs $off/$cap/$h set and $end/$slot
+// locals declared. `idxExpr` is the first-slot index (defaults to h mod cap; cap is pow2).
+const probeStart = (entrySize, idxExpr = '(i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1)))') =>
+  `(local.set $end (i32.add (local.get $off) (i32.mul (local.get $cap) (i32.const ${entrySize}))))
+    (local.set $slot (i32.add (local.get $off) (i32.mul ${idxExpr} (i32.const ${entrySize}))))`
+const probeNext = (entrySize) =>
+  `(local.set $slot (i32.add (local.get $slot) (i32.const ${entrySize})))
+      (if (i32.ge_u (local.get $slot) (local.get $end)) (then (local.set $slot (local.get $off))))`
+
 /** Generate upsert (add/set) probe function. hasVal: store value at slot+16.
  *  hasExt: emit EXTERNAL fallthrough (call $__ext_set on non-matching type).
  *  Gated off → type mismatch just returns coll unchanged. */
@@ -62,14 +72,13 @@ function genUpsert(name, entrySize, hashFn, eqExpr, expectedType, hasVal, hasExt
     ? `(if (i32.ne ${tExpr} (i32.const ${expectedType})) (then (if (i32.eq ${tExpr} (i32.const ${PTR.EXTERNAL})) ${extBranch}) (return (local.get $coll))))`
     : `(if (i32.ne ${tExpr} (i32.const ${expectedType})) (then (return (local.get $coll))))`
   return `(func $${name} (param $coll i64) (param $key i64) ${valParam}(result i64)
-    (local $off i32) (local $cap i32) (local $h i32) (local $idx i32) (local $slot i32)
+    (local $off i32) (local $cap i32) (local $h i32) (local $end i32) (local $slot i32)
     ${typeGuard}
     (local.set $off (i32.wrap_i64 (i64.and (local.get $coll) (i64.const ${LAYOUT.OFFSET_MASK}))))
     (local.set $cap (i32.load (i32.sub (local.get $off) (i32.const 4))))
     (local.set $h (call ${hashFn} (local.get $key)))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot)))
         (then
           (i64.store (local.get $slot) (i64.extend_i32_u (local.get $h)))
@@ -78,7 +87,7 @@ function genUpsert(name, entrySize, hashFn, eqExpr, expectedType, hasVal, hasExt
             (i32.add (i32.load (i32.sub (local.get $off) (i32.const 8))) (i32.const 1)))
           (br $done)))
       (if ${eqExpr} ${onMatch})
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (br $probe)))
     (local.get $coll))`
 }
@@ -108,17 +117,16 @@ function genLookup(name, entrySize, hashFn, eqExpr, expectedType, wantValue, has
     : `(if (i32.ne ${tExpr} (i32.const ${expectedType})) (then ${onEmpty}))`
 
   return `(func $${name} (param $coll i64) (param $key i64) (result ${rt})
-    (local $off i32) (local $cap i32) (local $h i32) (local $idx i32) (local $slot i32) (local $tries i32)
+    (local $off i32) (local $cap i32) (local $h i32) (local $end i32) (local $slot i32) (local $tries i32)
     ${typeGuard}
     (local.set $off (i32.wrap_i64 (i64.and (local.get $coll) (i64.const ${LAYOUT.OFFSET_MASK}))))
     (local.set $cap (i32.load (i32.sub (local.get $off) (i32.const 4))))
     (local.set $h (call ${hashFn} (local.get $key)))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot))) (then ${onEmpty}))
       (if ${eqExpr} (then ${onFound}))
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (local.set $tries (i32.add (local.get $tries) (i32.const 1)))
       (br_if $done (i32.ge_s (local.get $tries) (local.get $cap)))
       (br $probe)))
@@ -128,21 +136,20 @@ function genLookup(name, entrySize, hashFn, eqExpr, expectedType, wantValue, has
 /** Generate delete probe function. Zero out entry on match. */
 function genDelete(name, entrySize, hashFn, eqExpr, expectedType) {
   return `(func $${name} (param $coll i64) (param $key i64) (result i32)
-    (local $off i32) (local $cap i32) (local $h i32) (local $idx i32) (local $slot i32) (local $tries i32)
+    (local $off i32) (local $cap i32) (local $h i32) (local $end i32) (local $slot i32) (local $tries i32)
     (if (i32.ne (call $__ptr_type (local.get $coll)) (i32.const ${expectedType})) (then (return (i32.const 0))))
     (local.set $off (call $__ptr_offset (local.get $coll)))
     (local.set $cap (i32.load (i32.sub (local.get $off) (i32.const 4))))
     (local.set $h (call ${hashFn} (local.get $key)))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot))) (then (return (i32.const 0))))
       (if ${eqExpr}
         (then
           (i64.store (local.get $slot) (i64.const 0))
           (i64.store (i32.add (local.get $slot) (i32.const 8)) (i64.const 0))
           (return (i32.const 1))))
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (local.set $tries (i32.add (local.get $tries) (i32.const 1)))
       (br_if $done (i32.ge_s (local.get $tries) (local.get $cap)))
       (br $probe)))
@@ -168,7 +175,7 @@ function genUpsertGrow(name, entrySize, hashFn, eqExpr, typeConst, strict = fals
           ${nonHashFallback}
           (return (local.get $obj))))`
   return `(func $${name} (param $obj i64) (param $key i64) (param $val i64) (result i64)
-    (local $off i32) (local $cap i32) (local $h i32) (local $idx i32) (local $slot i32)
+    (local $off i32) (local $cap i32) (local $h i32) (local $end i32) (local $slot i32)
     (local $size i32) (local $newptr i32) (local $newcap i32) (local $i i32)
     (local $oldslot i32) (local $newidx i32) (local $newslot i32)
     ${typeGuard}
@@ -205,9 +212,8 @@ function genUpsertGrow(name, entrySize, hashFn, eqExpr, typeConst, strict = fals
         (local.set $obj (i64.reinterpret_f64 (call $__mkptr (i32.const ${typeConst}) (i32.const 0) (local.get $newptr))))))
     ;; Insert/update
     (local.set $h (call ${hashFn} (local.get $key)))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot)))
         (then
           (i64.store (local.get $slot) (i64.extend_i32_u (local.get $h)))
@@ -220,14 +226,14 @@ function genUpsertGrow(name, entrySize, hashFn, eqExpr, typeConst, strict = fals
         (then
           (i64.store (i32.add (local.get $slot) (i32.const 16)) (local.get $val))
           (br $done)))
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (br $probe)))
     (local.get $obj))`
 }
 
 function genLookupStrict(name, entrySize, hashFn, eqExpr, expectedType, missing = UNDEF_NAN) {
   return `(func $${name} (param $coll i64) (param $key i64) (result i64)
-    (local $off i32) (local $cap i32) (local $h i32) (local $idx i32) (local $slot i32) (local $tries i32)
+    (local $off i32) (local $cap i32) (local $h i32) (local $end i32) (local $slot i32) (local $tries i32)
     (if (i32.ne
           (i32.wrap_i64 (i64.and (i64.shr_u (local.get $coll) (i64.const ${LAYOUT.TAG_SHIFT})) (i64.const ${LAYOUT.TAG_MASK})))
           (i32.const ${expectedType}))
@@ -235,14 +241,13 @@ function genLookupStrict(name, entrySize, hashFn, eqExpr, expectedType, missing 
     (local.set $off (i32.wrap_i64 (i64.and (local.get $coll) (i64.const ${LAYOUT.OFFSET_MASK}))))
     (local.set $cap (i32.load (i32.sub (local.get $off) (i32.const 4))))
     (local.set $h (call ${hashFn} (local.get $key)))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot)))
         (then (return (i64.const ${missing}))))
       (if ${eqExpr}
         (then (return (i64.load (i32.add (local.get $slot) (i32.const 16))))))
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (local.set $tries (i32.add (local.get $tries) (i32.const 1)))
       (br_if $done (i32.ge_s (local.get $tries) (local.get $cap)))
       (br $probe)))
@@ -260,18 +265,17 @@ function genLookupStrictPrehashed(name, entrySize, eqExpr, expectedType, missing
     : `(if (i32.ne ${tExpr} (i32.const ${expectedType}))
       (then (return (i64.const ${missing}))))`
   return `(func $${name} (param $coll i64) (param $key i64) (param $h i32) (result i64)
-    (local $off i32) (local $cap i32) (local $idx i32) (local $slot i32) (local $tries i32)
+    (local $off i32) (local $cap i32) (local $end i32) (local $slot i32) (local $tries i32)
     ${typeGuard}
     (local.set $off (i32.wrap_i64 (i64.and (local.get $coll) (i64.const ${LAYOUT.OFFSET_MASK}))))
     (local.set $cap (i32.load (i32.sub (local.get $off) (i32.const 4))))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot)))
         (then (return (i64.const ${missing}))))
       (if ${eqExpr}
         (then (return (i64.load (i32.add (local.get $slot) (i32.const 16))))))
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (local.set $tries (i32.add (local.get $tries) (i32.const 1)))
       (br_if $done (i32.ge_s (local.get $tries) (local.get $cap)))
       (br $probe)))
@@ -280,16 +284,15 @@ function genLookupStrictPrehashed(name, entrySize, eqExpr, expectedType, missing
 
 function genUpsertStrictPrehashed(name, entrySize, eqExpr, expectedType) {
   return `(func $${name} (param $obj i64) (param $key i64) (param $h i32) (param $val i64) (result i64)
-    (local $off i32) (local $cap i32) (local $idx i32) (local $slot i32)
+    (local $off i32) (local $cap i32) (local $end i32) (local $slot i32)
     (if (i32.ne
           (i32.wrap_i64 (i64.and (i64.shr_u (local.get $obj) (i64.const ${LAYOUT.TAG_SHIFT})) (i64.const ${LAYOUT.TAG_MASK})))
           (i32.const ${expectedType}))
       (then (return (local.get $obj))))
     (local.set $off (i32.wrap_i64 (i64.and (local.get $obj) (i64.const ${LAYOUT.OFFSET_MASK}))))
     (local.set $cap (i32.load (i32.sub (local.get $off) (i32.const 4))))
-    (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $cap) (i32.const 1))))
+    ${probeStart(entrySize)}
     (block $done (loop $probe
-      (local.set $slot (i32.add (local.get $off) (i32.mul (local.get $idx) (i32.const ${entrySize}))))
       (if (i64.eqz (i64.load (local.get $slot)))
         (then
           (i64.store (local.get $slot) (i64.extend_i32_u (local.get $h)))
@@ -302,7 +305,7 @@ function genUpsertStrictPrehashed(name, entrySize, eqExpr, expectedType) {
         (then
           (i64.store (i32.add (local.get $slot) (i32.const 16)) (local.get $val))
           (br $done)))
-      (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $cap) (i32.const 1))))
+      ${probeNext(entrySize)}
       (br $probe)))
     (local.get $obj))`
 }
@@ -340,9 +343,11 @@ export default (ctx) => {
     __hash_set_local: ['__str_hash', '__str_eq'],
     __ihash_get_local: ['__map_hash'],
     __ihash_set_local: ['__map_hash', '__alloc_hdr', '__mkptr'],
-    __dyn_get_t: ['__ihash_get_local', '__str_hash', '__str_eq', '__is_nullish'],
+    __dyn_get_t: ['__dyn_get_t_h', '__str_hash'],
+    __dyn_get_t_h: ['__ihash_get_local', '__str_eq', '__is_nullish'],
     __dyn_get: ['__dyn_get_t', '__ptr_type'],
     __dyn_get_expr_t: ['__dyn_get_t', '__hash_get_local'],
+    __dyn_get_expr_t_h: ['__dyn_get_t_h', '__hash_get_local_h'],
     __dyn_get_expr: ['__dyn_get_expr_t', '__ptr_type'],
     __dyn_get_any: ['__dyn_get_any_t', '__ptr_type'],
     __dyn_get_any_t: () => ctx.features.external
@@ -666,11 +671,22 @@ export default (ctx) => {
   ctx.core.stdlib['__dyn_get'] = `(func $__dyn_get (param $obj i64) (param $key i64) (result i64)
     (call $__dyn_get_t (local.get $obj) (local.get $key) (call $__ptr_type (local.get $obj))))`
 
-  ctx.core.stdlib['__dyn_get_t'] = () => `(func $__dyn_get_t (param $obj i64) (param $key i64) (param $type i32) (result i64)
+  // Thin wrapper: hash the key once, delegate to the prehashed body. Constant-key
+  // call sites bypass this and call $__dyn_get_t_h directly with strHashLiteral().
+  ctx.core.stdlib['__dyn_get_t'] = `(func $__dyn_get_t (param $obj i64) (param $key i64) (param $type i32) (result i64)
+    (call $__dyn_get_t_h (local.get $obj) (local.get $key) (local.get $type) (call $__str_hash (local.get $key))))`
+
+  ctx.core.stdlib['__dyn_get_t_h'] = () => `(func $__dyn_get_t_h (param $obj i64) (param $key i64) (param $type i32) (param $h i32) (result i64)
     (local $props i64) (local $off i32)
-    (local $poff i32) (local $pcap i32) (local $h i32) (local $idx i32) (local $slot i32) (local $tries i32)
+    (local $poff i32) (local $pcap i32) (local $pend i32) (local $idx i32) (local $slot i32) (local $tries i32)
     ${buildObjectSchemaLocals()}
     (local.set $off (i32.wrap_i64 (i64.and (local.get $obj) (i64.const ${LAYOUT.OFFSET_MASK}))))
+    ;; CLOSURE with no env (offset 0): many function refs share offset 0, so key the
+    ;; global __dyn_props hash on the function table index (negative — can't collide
+    ;; with real heap/data offsets). Closures *with* env keep their unique env ptr.
+    (if (i32.and (i32.eq (local.get $type) (i32.const ${PTR.CLOSURE})) (i32.eqz (local.get $off)))
+      (then (local.set $off (i32.sub (i32.const -1)
+        (i32.wrap_i64 (i64.and (i64.shr_u (local.get $obj) (i64.const ${LAYOUT.AUX_SHIFT})) (i64.const ${LAYOUT.AUX_MASK})))))))
     (if (i32.eq (local.get $type) (i32.const ${PTR.ARRAY}))
       (then
         (block $done
@@ -735,14 +751,14 @@ export default (ctx) => {
                 (global.set $__dyn_get_cache_props (f64.reinterpret_i64 (local.get $props))))))))
       (local.set $poff (i32.wrap_i64 (i64.and (local.get $props) (i64.const ${LAYOUT.OFFSET_MASK}))))
       (local.set $pcap (i32.load (i32.sub (local.get $poff) (i32.const 4))))
-      (local.set $h (call $__str_hash (local.get $key)))
-      (local.set $idx (i32.and (local.get $h) (i32.sub (local.get $pcap) (i32.const 1))))
+      (local.set $pend (i32.add (local.get $poff) (i32.mul (local.get $pcap) (i32.const ${MAP_ENTRY}))))
+      (local.set $slot (i32.add (local.get $poff) (i32.mul (i32.and (local.get $h) (i32.sub (local.get $pcap) (i32.const 1))) (i32.const ${MAP_ENTRY}))))
       (block $hdone (loop $hprobe
-        (local.set $slot (i32.add (local.get $poff) (i32.mul (local.get $idx) (i32.const ${MAP_ENTRY}))))
         (br_if $dynDone (i64.eqz (i64.load (local.get $slot))))
         (if (call $__str_eq (i64.load (i32.add (local.get $slot) (i32.const 8))) (local.get $key))
           (then (return (i64.load (i32.add (local.get $slot) (i32.const 16))))))
-        (local.set $idx (i32.and (i32.add (local.get $idx) (i32.const 1)) (i32.sub (local.get $pcap) (i32.const 1))))
+        (local.set $slot (i32.add (local.get $slot) (i32.const ${MAP_ENTRY})))
+        (if (i32.ge_u (local.get $slot) (local.get $pend)) (then (local.set $slot (local.get $poff))))
         (local.set $tries (i32.add (local.get $tries) (i32.const 1)))
         (br_if $hdone (i32.ge_s (local.get $tries) (local.get $pcap)))
         (br $hprobe))))${buildObjectSchemaArm()}
@@ -768,6 +784,19 @@ export default (ctx) => {
       (else
         (if (result i64) (i32.eq (local.get $t) (i32.const ${PTR.HASH}))
           (then (call $__hash_get_local (local.get $obj) (local.get $key)))
+          (else (i64.const ${NULL_NAN}))))))`
+
+  // Prehashed variant of __dyn_get_expr_t for constant string keys: the FNV hash
+  // is folded at compile time (strHashLiteral), so no __str_hash call at runtime.
+  ctx.core.stdlib['__dyn_get_expr_t_h'] = `(func $__dyn_get_expr_t_h (param $obj i64) (param $key i64) (param $t i32) (param $h i32) (result i64)
+    (local $val i64)
+    (local.set $val (call $__dyn_get_t_h (local.get $obj) (local.get $key) (local.get $t) (local.get $h)))
+    (if (result i64)
+      (i64.ne (local.get $val) (i64.const ${UNDEF_NAN}))
+      (then (local.get $val))
+      (else
+        (if (result i64) (i32.eq (local.get $t) (i32.const ${PTR.HASH}))
+          (then (call $__hash_get_local_h (local.get $obj) (local.get $key) (local.get $h)))
           (else (i64.const ${NULL_NAN}))))))`
 
   // Like __dyn_get_expr but also resolves EXTERNAL host objects via __ext_prop.
@@ -809,6 +838,10 @@ export default (ctx) => {
     (local $off i32) (local $type i32) ${buildObjectSchemaSetLocals()}
     (local.set $off (i32.wrap_i64 (i64.and (local.get $obj) (i64.const ${LAYOUT.OFFSET_MASK}))))
     (local.set $type (i32.wrap_i64 (i64.and (i64.shr_u (local.get $obj) (i64.const ${LAYOUT.TAG_SHIFT})) (i64.const ${LAYOUT.TAG_MASK}))))
+    ;; CLOSURE with no env (offset 0): key __dyn_props on the function table index — see __dyn_get_t.
+    (if (i32.and (i32.eq (local.get $type) (i32.const ${PTR.CLOSURE})) (i32.eqz (local.get $off)))
+      (then (local.set $off (i32.sub (i32.const -1)
+        (i32.wrap_i64 (i64.and (i64.shr_u (local.get $obj) (i64.const ${LAYOUT.AUX_SHIFT})) (i64.const ${LAYOUT.AUX_MASK})))))))
     (if (i32.eq (local.get $type) (i32.const ${PTR.ARRAY}))
       (then
         (block $done

@@ -30,7 +30,8 @@ const CASE_NAMES = {
   aos: 'AoS to SoA',
   mandelbrot: 'mandelbrot escape',
   json: 'JSON parse+walk (single literal source)',
-  'json-dynamic': 'JSON parse+walk (runtime variant source)',
+  sort: 'in-place heapsort',
+  crc32: 'CRC-32 table hash',
   watr: 'watr WAT compiler',
 }
 
@@ -148,16 +149,18 @@ const watrModuleSources = () => ({
 
 const compileJzHost = c => {
   const code = readFileSync(c.js, 'utf8')
+  const isWatr = c.id === 'watr'
   const wasm = compile(code, {
+    jzify: isWatr,
     modules: {
       '../_lib/benchlib.js': benchlibHostSource(),
-      ...(c.id === 'watr' ? watrModuleSources() : {}),
+      ...(isWatr ? watrModuleSources() : {}),
     },
     imports: {
       env: { logResult: { params: 5 } },
       performance: { now: { params: 0, returns: 'number' } },
     },
-    optimize: { scalarTypedArrayLen: 16, scalarTypedLoopUnroll: 8, ...(c.id === 'watr' ? { watr: false, smallConstForUnroll: false } : {}), ...(process.env.JZ_SIMD ? { vectorizeLaneLocal: true } : {}) },
+    optimize: { scalarTypedArrayLen: 16, scalarTypedLoopUnroll: 8, ...(isWatr ? { watr: false, smallConstForUnroll: false } : {}), ...(process.env.JZ_SIMD ? { vectorizeLaneLocal: true } : {}) },
     alloc: false,
   })
   writeFileSync(jzHostWasmPath(c), wasm)
@@ -282,7 +285,11 @@ const targets = {
     available: c => !!c.zig && has('zig'),
     bin: zigPath,
     run: c => tryRun('zig', c, () => {
-      execFileSync('zig', ['build-exe', c.zig, '-O', 'ReleaseFast', '-femit-bin=' + zigPath(c)], { cwd: BENCH_DIR, stdio: 'pipe' })
+      const zigCache = build('zig-cache')
+      const zigGlobalCache = build('zig-global-cache')
+      mkdirSync(zigCache, { recursive: true })
+      mkdirSync(zigGlobalCache, { recursive: true })
+      execFileSync('zig', ['build-exe', c.zig, '-O', 'ReleaseFast', '--cache-dir', zigCache, '--global-cache-dir', zigGlobalCache, '-femit-bin=' + zigPath(c)], { cwd: BENCH_DIR, stdio: 'pipe' })
     }, [zigPath(c)]),
   },
   python: {

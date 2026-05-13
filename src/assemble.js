@@ -14,6 +14,25 @@
 
 import { parse as parseWat } from 'watr'
 import { ctx, inc, resolveIncludes, PTR, LAYOUT } from './ctx.js'
+
+// Stdlib WAT templates are fixed text (or feature-keyed text from a factory) —
+// `parseWat` of the same string always yields the same tree. Parsing is the
+// dominant cost when a program pulls heavy stdlib (Math pow/sqrt, JSON, regex):
+// it re-tokenizes ~KB of text every compile. Parse once per distinct resolved
+// string, then hand out a deep clone (downstream passes mutate nodes in place).
+// Module-level on purpose: the cache persists across compile() calls.
+const stdlibParseCache = new Map()  // resolved WAT string → pristine parsed tree
+const cloneTemplate = (node) => {
+  if (!Array.isArray(node)) return node
+  const copy = node.map(cloneTemplate)
+  if (node.loc != null) copy.loc = node.loc
+  return copy
+}
+const parseTemplate = (str) => {
+  let tmpl = stdlibParseCache.get(str)
+  if (tmpl === undefined) stdlibParseCache.set(str, tmpl = parseWat(str))
+  return cloneTemplate(tmpl)
+}
 import { T, VAL, analyzeValTypes } from './analyze.js'
 import { optimizeFunc, hoistConstantPool, specializeMkptr, specializePtrBase, sortStrPoolByFreq, arenaRewindModule } from './optimize.js'
 import { emit } from './emit.js'
@@ -169,6 +188,8 @@ export function buildStartFn(ast, sec, closureFuncs, compilePendingClosures) {
     ctx.core.includes.has('__stringify') ||
     ctx.core.includes.has('__dyn_get') ||
     ctx.core.includes.has('__dyn_get_t') ||
+    ctx.core.includes.has('__dyn_get_t_h') ||
+    ctx.core.includes.has('__dyn_get_expr_t_h') ||
     ctx.core.includes.has('__dyn_get_any') ||
     ctx.core.includes.has('__dyn_get_any_t') ||
     ctx.core.includes.has('__dyn_get_expr') ||
@@ -382,7 +403,7 @@ export function pullStdlib(sec) {
     if (ctx.memory.shared) sec.imports.push(['import', '"env"', '"memory"', ['memory', pages]])
     else sec.memory.push(['memory', ['export', '"memory"'], pages])
     if (ctx.transform.alloc !== false && ctx.core._allocRawFuncs)
-      sec.funcs.push(...ctx.core._allocRawFuncs.map(s => parseWat(s)))
+      sec.funcs.push(...ctx.core._allocRawFuncs.map(parseTemplate))
   }
 
   const stdlibStr = (name) => {
@@ -392,14 +413,14 @@ export function pullStdlib(sec) {
   ctx.core.extImports ??= new Set()
   for (const name of Object.keys(ctx.core.stdlib)) {
     if (name.startsWith('__ext_') && ctx.core.includes.has(name)) {
-      const parsed = parseWat(stdlibStr(name))
+      const parsed = parseTemplate(stdlibStr(name))
       sec.extStdlib.push(parsed[0] === "module" ? parsed[1] : parsed)
       ctx.core.extImports.add(name)
       ctx.core.includes.delete(name)
     }
   }
   for (const n of ctx.core.includes) if (!ctx.core.stdlib[n]) console.error("MISSING stdlib:", n)
-  sec.stdlib.push(...[...ctx.core.includes].map(n => parseWat(stdlibStr(n))))
+  sec.stdlib.push(...[...ctx.core.includes].map(n => parseTemplate(stdlibStr(n))))
 }
 
 export function syncImports(sec) {
@@ -423,7 +444,18 @@ export function optimizeModule(sec) {
     ctx.runtime.strPool = poolRef.pool
   }
   if (cfg && ctx.transform.host) cfg.__host = ctx.transform.host
-  for (const s of [...sec.funcs, ...sec.stdlib, ...sec.start]) optimizeFunc(s, cfg)
+  // Backfill globalTypes for runtime globals declared only in ctx.scope.globals
+  // (e.g., __schema_tbl, __strBase). Parses the WAT string to infer i32/f64/i64.
+  if (ctx.scope.globals) {
+    for (const [name, wat] of ctx.scope.globals) {
+      if (!wat || ctx.scope.globalTypes.has(name)) continue
+      const m = wat.match(/\(global\s+\$?\S+\s+(?:\(mut\s+)?(i32|i64|f64|f32)/)
+      if (m) ctx.scope.globalTypes.set(name, m[1])
+    }
+  }
+  // Build global name→type map from ctx.scope.globalTypes (keys without $) for promoteGlobals
+  const globalTypesMap = ctx.scope.globalTypes ? new Map([...ctx.scope.globalTypes].map(([k, v]) => [`$${k}`, v])) : null
+  for (const s of [...sec.funcs, ...sec.stdlib, ...sec.start]) optimizeFunc(s, cfg, globalTypesMap)
   if (!cfg || cfg.arenaRewind !== false) {
     const safeCallees = arenaRewindModule([...sec.funcs, ...sec.stdlib, ...sec.start])
     const fnByName = new Map()
@@ -439,12 +471,25 @@ export function optimizeModule(sec) {
   if (!cfg || cfg.hoistConstantPool !== false)
     hoistConstantPool([...sec.funcs, ...sec.stdlib, ...sec.start], (name, wat) => ctx.scope.globals.set(name, wat))
 
+  // Second promoteGlobals pass disabled: promoting hoistConstantPool's __fc*
+  // globals regressed the watr perf micro-pin (WASM compile time increased).
+  // The __fc* globals are typically read 3-4 times; the local setup overhead
+  // in large functions outweighs the per-read savings.  Left as a no-op hook
+  // in case future analysis finds a profitable threshold or function-size gate.
+  // if (!cfg || cfg.promoteGlobals !== false) {
+  //   const globalTypesMap2 = ctx.scope.globalTypes ? new Map([...ctx.scope.globalTypes].map(([k, v]) => [`$${k}`, v])) : null
+  //   for (const s of [...sec.funcs, ...sec.stdlib, ...sec.start]) promoteGlobals(s, globalTypesMap2)
+  // }
+
   const dataLen = ctx.runtime.data?.length || 0
   if (dataLen > 1024 && !ctx.memory.shared) {
     const heapBase = (dataLen + 7) & ~7
     ctx.scope.globals.set('__heap', `(global $__heap (mut i32) (i32.const ${heapBase}))`)
-    if (ctx.scope.globals.has('__heap_start'))
+    ctx.scope.globalTypes.set('__heap', 'i32')
+    if (ctx.scope.globals.has('__heap_start')) {
       ctx.scope.globals.set('__heap_start', `(global $__heap_start (mut i32) (i32.const ${heapBase}))`)
+      ctx.scope.globalTypes.set('__heap_start', 'i32')
+    }
     for (const s of sec.stdlib)
       if (s[0] === 'func' && s[1] === '$__clear')
         for (let i = 2; i < s.length; i++)

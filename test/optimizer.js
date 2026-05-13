@@ -57,10 +57,14 @@ test('LICM: shared IR subtree (slice + slice-loop pattern) must not corrupt outs
 test('LICM: actually fires for invariant cell read in non-call loop', () => {
   // Sanity: when conditions are right (no calls, no shared IR, no writes),
   // LICM should hoist the cell load and emit a $__sc snap local.
+  // `inc` must *escape* (passed to `keep`) so it stays a real closure that
+  // mutates the captured `i` via a heap cell — otherwise inlineLocalLambdas
+  // would splice it away and `i` would just be a plain wasm local.
   const wat = jz.compile(`
+    const keep = (f) => f
     export const main = () => {
       let i = 0
-      const inc = () => i = i + 1
+      const inc = keep(() => i = i + 1)
       let s = 0
       for (let j = 0; j < 10; j++) s = s + i + i
       inc()
@@ -443,6 +447,45 @@ test('fixed Float64Array callsites scalar-replace across exported caller and SIM
   almost(main(5), refMain(5), 1e-9)
 })
 
+test('fixed integer typed-array locals scalar-replace with element coercion', () => {
+  const src = `
+    export const main = () => {
+      const lut = new Int32Array(4)
+      for (let i = 0; i < 4; i++) lut[i] = i * 3.7
+      const tape = new Uint8Array(3)
+      tape[0] = 257
+      tape[1] = -1
+      tape[2] = lut[3] & 7
+      return lut[0] + lut[1] + lut[2] + lut[3] + tape[0] + tape[1] + tape[2]
+    }
+  `
+  const wat = jz.compile(src, { wat: true, optimize: { watr: false, sourceInline: false } })
+  const mainWat = wat.match(/\(func \$main[\s\S]*?^  \)/m)?.[0] || ''
+  ok(!/\$__alloc\b/.test(mainWat), 'local fixed integer typed arrays should not allocate')
+  ok(!/i32\.(?:load|store)\b/.test(mainWat), 'local fixed integer typed-array slots should stay in locals')
+  // Truncation matches JS: Int32Array trunc-toward-zero, Uint8Array & 0xFF.
+  const ref = (() => {
+    const lut = new Int32Array(4); for (let i = 0; i < 4; i++) lut[i] = i * 3.7
+    const tape = new Uint8Array(3); tape[0] = 257; tape[1] = -1; tape[2] = lut[3] & 7
+    return lut[0] + lut[1] + lut[2] + lut[3] + tape[0] + tape[1] + tape[2]
+  })()
+  is(run(src).main(), ref)
+})
+
+test('escaping integer typed array keeps its allocation (no unsound mirror)', () => {
+  const src = `
+    const fill = (a) => { for (let i = 0; i < 4; i++) a[i] = i }
+    export const main = () => {
+      const a = new Int32Array(4)
+      fill(a)
+      return a[0] + a[1] + a[2] + a[3]
+    }
+  `
+  const wat = jz.compile(src, { wat: true, optimize: { watr: false, sourceInline: false } })
+  ok(/\$__alloc_hdr\b/.test(wat), 'escaping integer typed array must stay heap-allocated')
+  is(run(src).main(), 6)
+})
+
 test('nested small const-count for-loop unroll is opt-in', () => {
   const wat = jz.compile(`
     export const main = () => {
@@ -780,7 +823,7 @@ test('resolveOptimize: levels, booleans, object overrides', () => {
   }
   is(resolveOptimize(0).watr, false)
   is(resolveOptimize(0).treeshake, false)
-  is(resolveOptimize(2).watr, true)
+  is(resolveOptimize(2).watr, false)
   is(resolveOptimize(2).sourceInline, true)
   is(resolveOptimize(2).nestedSmallConstForUnroll, 'auto')
   is(resolveOptimize(3).sourceInline, true)
@@ -799,9 +842,32 @@ test('resolveOptimize: levels, booleans, object overrides', () => {
   is(o.treeshake, false)
   is(resolveOptimize({ level: 3, nestedSmallConstForUnroll: 'auto' }).nestedSmallConstForUnroll, 'auto')
   // undefined: default = level 2
-  is(resolveOptimize(undefined).watr, true)
+  is(resolveOptimize(undefined).watr, false)
   is(resolveOptimize(undefined).sourceInline, true)
   is(resolveOptimize(undefined).nestedSmallConstForUnroll, 'auto')
+  // string aliases
+  const balanced = resolveOptimize('balanced')
+  for (const n of PASS_NAMES) is(balanced[n], resolveOptimize(2)[n], `'balanced': ${n} matches level 2`)
+  const size = resolveOptimize('size')
+  is(size.watr, false)
+  is(size.smallConstForUnroll, false)
+  is(size.nestedSmallConstForUnroll, false)
+  is(size.vectorizeLaneLocal, false)
+  is(size.treeshake, true)
+  is(size.scalarTypedArrayLen, 8)
+  is(size.scalarTypedLoopUnroll, 4)
+  const speed = resolveOptimize('speed')
+  is(speed.watr, false)
+  is(speed.vectorizeLaneLocal, true)
+  is(speed.nestedSmallConstForUnroll, true)
+  is(speed.smallConstForUnroll, true)
+  // unknown string falls back to level 2
+  is(resolveOptimize('bogus').sourceInline, true)
+  // object with string level base + override
+  const sizePlusVec = resolveOptimize({ level: 'size', vectorizeLaneLocal: true })
+  is(sizePlusVec.vectorizeLaneLocal, true)
+  is(sizePlusVec.smallConstForUnroll, false)
+  is(sizePlusVec.scalarTypedArrayLen, 8)
 })
 
 test('opts.optimize: false produces correct output (semantics preserved)', () => {
@@ -833,4 +899,20 @@ test('opts.optimize: object override gates per-pass', () => {
   const sized = jz.compile(src, { optimize: { treeshake: false } })
   const shaken = jz.compile(src, { optimize: true })
   ok(sized.length >= shaken.length, `treeshake:false (${sized.length}) ≥ treeshake:true (${shaken.length})`)
+})
+
+test('deadStoreElim: dead `local.set` with side-effecting RHS must keep the RHS', () => {
+  // A small-constant warmup loop unrolls into N consecutive `cs = side()` writes
+  // whose results are all overwritten before any read. deadStoreElim must NOT
+  // delete those `local.set`s wholesale — `side()` mutates the array each call.
+  const { main } = run(`
+    const bump = (a) => { a[0] = a[0] + 1; return a[0] | 0 }
+    export const main = () => {
+      const a = new Int32Array(1)
+      let cs = 0
+      for (let i = 0; i < 5; i++) cs = bump(a)
+      return a[0] | 0
+    }
+  `, { optimize: 2 })
+  is(main(), 5)
 })

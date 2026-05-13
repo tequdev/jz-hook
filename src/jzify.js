@@ -26,11 +26,12 @@ export default function jzify(ast) {
   swIdx = 0
   argsIdx = 0
   doIdx = 0
+  classIdx = 0
   // Hoist module-level vars: any `var x` inside nested blocks bubbles up.
   const names = new Set()
   ast = hoistVars(ast, names)
   if (names.size) ast = prependDecls(ast, names)
-  return transformScope(ast)
+  return foldStaticExportHelpers(transformScope(ast))
 }
 
 /**
@@ -70,12 +71,20 @@ function hoistVars(node, names) {
     }
     return [op, lhs, hoistVars(node[2], names)]
   }
+  if (op === '=' && Array.isArray(node[1]) && node[1][0] === 'var' && typeof node[1][1] === 'string' && node[1].length === 2) {
+    names.add(node[1][1])
+    return ['=', node[1][1], hoistVars(node[2], names)]
+  }
   // For-head `;` is positional (init; cond; update), not a statement sequence.
   // Recurse into each slot but never filter nulls — empty slots are valid.
   if (op === 'for') {
     const head = node[1]
     let h2
-    if (Array.isArray(head) && head[0] === ';') {
+    if (Array.isArray(head) && head[0] === 'var' && Array.isArray(head[1]) &&
+        (head[1][0] === 'in' || head[1][0] === 'of') && typeof head[1][1] === 'string') {
+      names.add(head[1][1])
+      h2 = [head[1][0], head[1][1], hoistVars(head[1][2], names)]
+    } else if (Array.isArray(head) && head[0] === ';') {
       h2 = [';']
       for (let i = 1; i < head.length; i++) h2.push(hoistVars(head[i], names))
     } else {
@@ -144,14 +153,41 @@ function transformScope(node) {
 
   // Single named function-statement at scope position: hoist as const arrow
   if (op === 'function' && args[0]) return hoistFnDecl(...args)
+  // Single statement-form class declaration: bind the factory (no hoisting — classes are TDZ)
+  if (op === 'class' && args[0]) return ['let', ['=', args[0], lowerClass(...args)]]
 
   // Statement sequence: collect hoisted functions
   if (op === ';') {
     const hoisted = [], rest = []
-    for (const stmt of args) {
+    for (let i = 0; i < args.length; i++) {
+      const stmt = args[i]
+      // Workaround for subscript parser ASI bug: multiline named IIFE
+      // `(function name(){...})();` is parsed as two statements when there are
+      // newlines inside the function body. Reconstruct the single-statement IIFE
+      // so the () handler can desugar it correctly.
+      if (Array.isArray(stmt) && stmt[0] === '()' &&
+          Array.isArray(stmt[1]) && stmt[1][0] === 'function' && stmt[1][1] &&
+          i + 1 < args.length && Array.isArray(args[i + 1]) && args[i + 1][0] === '()') {
+        const merged = ['()', ['()', stmt[1]], args[i + 1][1] ?? null]
+        const t = transform(merged)
+        if (t != null) {
+          if (Array.isArray(t) && t[0] === ';') {
+            for (const s of t.slice(1)) { if (s != null) rest.push(s) }
+          } else {
+            rest.push(t)
+          }
+        }
+        i++
+        continue
+      }
       // Statement-form named function declaration: hoist directly (skip expression handler)
       if (Array.isArray(stmt) && stmt[0] === 'function' && stmt[1]) {
         hoisted.push(hoistFnDecl(stmt[1], stmt[2], stmt[3]))
+        continue
+      }
+      // Statement-form class declaration: bind the factory in place (not hoisted — TDZ)
+      if (Array.isArray(stmt) && stmt[0] === 'class' && stmt[1]) {
+        rest.push(['let', ['=', stmt[1], lowerClass(stmt[1], stmt[2], stmt[3])]])
         continue
       }
       const t = transform(stmt)
@@ -174,11 +210,33 @@ function transformScope(node) {
     // Hoist functions AFTER imports (imports must be processed first for scope resolution)
     const imports = rest.filter(s => Array.isArray(s) && s[0] === 'import')
     const nonImports = rest.filter(s => !(Array.isArray(s) && s[0] === 'import'))
-    const all = [...imports, ...hoisted, ...nonImports]
+    const all = dedupeRedecls([...imports, ...hoisted, ...nonImports])
     return all.length === 0 ? null : all.length === 1 ? all[0] : [';', ...all]
   }
 
   return transform(node)
+}
+
+/**
+ * Drop redundant re-declarations of the same name within one scope's statement
+ * list. JS allows `function f(){} var f;`, `var x; var x;`, `var x = 1; var x;` —
+ * jzify lowers `function`→`const` and `var`→`let`, which would otherwise emit two
+ * bindings for one slot (and a typed-slot clash in codegen). The first declaration
+ * wins; a later redeclaration keeps only its initializer, as a plain assignment.
+ */
+function dedupeRedecls(stmts) {
+  const nameOf = s => Array.isArray(s) && (s[0] === 'let' || s[0] === 'const' || s[0] === 'var')
+    ? (typeof s[1] === 'string' ? s[1]
+      : Array.isArray(s[1]) && s[1][0] === '=' && typeof s[1][1] === 'string' ? s[1][1] : null)
+    : null
+  const seen = new Set(), out = []
+  for (const s of stmts) {
+    const n = nameOf(s)
+    if (n == null) { out.push(s); continue }
+    if (seen.has(n)) { if (Array.isArray(s[1]) && s[1][0] === '=') out.push(['=', s[1][1], s[1][2]]); continue }
+    seen.add(n); out.push(s)
+  }
+  return out
 }
 
 /** Wrap function body for arrow conversion */
@@ -211,6 +269,19 @@ function usesArguments(node) {
   return false
 }
 
+// `arguments` is the implicit object only if the function body doesn't declare a
+// local of that name. Scan the body's own statement list (not nested scopes) for
+// `var/let/const arguments` — a regular `function` with `var arguments;` just has
+// an ordinary local, no arguments object.
+function bindsArguments(body) {
+  const isArgDecl = s => Array.isArray(s) && (s[0] === 'var' || s[0] === 'let' || s[0] === 'const') &&
+    s.slice(1).some(d => d === 'arguments' || (Array.isArray(d) && d[0] === '=' && d[1] === 'arguments'))
+  let n = body
+  if (Array.isArray(n) && n[0] === '{}') n = n[1]
+  if (Array.isArray(n) && n[0] === ';') return n.slice(1).some(isArgDecl)
+  return isArgDecl(n)
+}
+
 function renameArguments(node, to) {
   if (node === 'arguments') return to
   if (!Array.isArray(node)) return node
@@ -236,8 +307,19 @@ function paramList(params) {
   return [params]
 }
 
+// Destructuring pattern as a parameter — `[a,b]` / `{a,b}` (optionally with a
+// default). Plain `=` defaults and `...rest` are handled natively by emit, so
+// they don't by themselves force lowering.
+const isDestructurePat = p => Array.isArray(p) && (p[0] === '[]' || p[0] === '{}' || (p[0] === '=' && isDestructurePat(p[1])))
+
 function lowerArguments(params, body) {
-  if (!usesArguments(params) && !usesArguments(body)) return [params, body]
+  // A function body that declares its own `arguments` local: it's an ordinary
+  // variable, not the implicit object \u2014 rename it out of jz's reserved set,
+  // no rest param synthesized.
+  if (bindsArguments(body)) body = renameArguments(body, `\uE001arg${argsIdx++}`)
+  const paramsNeedLowering = paramList(params).some(isDestructurePat)
+  const usesArgsObj = usesArguments(params) || usesArguments(body)
+  if (!paramsNeedLowering && !usesArgsObj) return [params, body]
   const name = `\uE001arg${argsIdx++}`
   const decls = []
   for (const [idx, param] of paramList(params).entries()) {
@@ -251,11 +333,119 @@ function lowerArguments(params, body) {
     }
     decls.push(['=', param, ['[]', name, [null, idx]]])
   }
-  const renamed = renameArguments(body, name)
-  return [['()', ['...', name]], decls.length ? [';', ['let', ...decls], renamed] : renamed]
+  const renamed = usesArgsObj ? renameArguments(body, name) : body
+  return [['()', ['...', name]], decls.length ? prependParamDecls(['let', ...decls], renamed) : renamed]
+}
+
+function prependParamDecls(decl, body) {
+  if (Array.isArray(body) && body[0] === '{}') {
+    const inner = body[1]
+    if (Array.isArray(inner) && inner[0] === ';') return ['{}', [';', decl, ...inner.slice(1)]]
+    if (inner == null) return ['{}', decl]
+    return ['{}', [';', decl, inner]]
+  }
+  if (Array.isArray(body) && (body[0] === ';' || body[0] === 'return')) return [';', decl, body]
+  return ['{}', [';', decl, ['return', body]]]
 }
 
 const arrowParams = params => Array.isArray(params) && params[0] === '()' ? params : ['()', params]
+
+// === class lowering ===
+//
+// A class is lowered to a factory arrow. Instance state is a plain object;
+// methods are per-instance arrows capturing it (so `obj.m()` keeps working
+// without a separate `this` argument); `this` is renamed to that object;
+// `new C(a)` is already turned into `C(a)` by the `new` handler.
+//
+//   class Point { x = 0; y; constructor(a,b){ this.x = a; this.y = b }
+//                 dist(){ return Math.hypot(this.x, this.y) } }
+//   →
+//   let Point = (a, b) => {
+//     let selfN = { x: undefined, y: undefined,
+//                         dist: () => Math.hypot(selfN.x, selfN.y) }
+//     selfN.x = 0          // field initializers, in declaration order
+//     selfN.x = a          // then the constructor body
+//     selfN.y = b
+//     return selfN
+//   }
+//
+// Out of scope for now (rejected with a clear message): `extends`/`super`,
+// `static` members, getters/setters, computed/private-via-`#` member names are
+// kept as the literal key string `#name` (jz allows it).
+let classIdx = 0
+
+const classBodyItems = (body) =>
+  body == null ? [] : Array.isArray(body) && body[0] === ';' ? body.slice(1) : [body]
+
+// Rename `this` → `to`, not crossing into a nested `function`/`class` (those
+// rebind `this`); arrows inherit `this`, so they are crossed. Property *names*
+// (`obj.this`, `{this: …}` value-side only) are left alone.
+function renameThis(node, to) {
+  if (node === 'this') return to
+  if (!Array.isArray(node)) return node
+  if (node[0] === 'function' || node[0] === 'class') return node
+  if (node[0] === '.' || node[0] === '?.') return [node[0], renameThis(node[1], to), node[2]]
+  if (node[0] === ':') return [node[0], node[1], renameThis(node[2], to)]
+  return node.map(n => renameThis(n, to))
+}
+
+function jzifyError(msg) { throw new Error(`jzify: ${msg}`) }
+
+function lowerClass(name, heritage, body) {
+  if (heritage != null) jzifyError('`class … extends …` is not supported yet — flatten the hierarchy or compose explicitly')
+  let ctorParams = null, ctorBody = null
+  const methods = [], fields = []
+  for (const it of classBodyItems(body)) {
+    if (typeof it === 'string') { fields.push([it, null]); continue }   // bare `x;`
+    if (!Array.isArray(it)) continue
+    if (it[0] === ':' && Array.isArray(it[2]) && it[2][0] === '=>') {
+      if (typeof it[1] !== 'string') jzifyError('computed class member names are not supported')
+      if (it[1] === 'constructor') { ctorParams = it[2][1]; ctorBody = it[2][2] }
+      else methods.push([it[1], it[2][1], it[2][2]])
+      continue
+    }
+    if (it[0] === '=') {
+      const lhs = it[1]
+      if (Array.isArray(lhs) && lhs[0] === 'static') jzifyError('`static` class members are not supported yet')
+      if (typeof lhs !== 'string') jzifyError('computed/destructured class fields are not supported')
+      fields.push([lhs, it[2]])
+      continue
+    }
+    if (it[0] === 'get' || it[0] === 'set') jzifyError('class getters/setters are not supported — jz objects have no accessors')
+    if (it[0] === 'static') jzifyError('`static` class members are not supported yet')
+    jzifyError(`unsupported class member ${JSON.stringify(it).slice(0, 60)}`)
+  }
+  const self = `self${classIdx++}`
+  const UNDEF = []                                  // jessie's node for `undefined`
+  // A class member body from jessie is a bare statement / `;`-sequence — wrap it
+  // in a `{}` block so the `=>` handler treats it as a function body, not an
+  // expression (an unwrapped `;`-seq arrow body produces malformed IR).
+  const block = b => Array.isArray(b) && b[0] === '{}' ? b : ['{}', b]
+  const usesThis = n => n === 'this' || (Array.isArray(n) && n[0] !== 'function' && n[0] !== 'class' && n.some(usesThis))
+  // Object literal: every declared field (its initializer inline when it doesn't
+  // touch `this`, else `undefined` and assigned below), every method as its
+  // self-capturing arrow. Declaring all fields up front fixes the object shape.
+  const litProps = [], deferred = []
+  for (const [fname, init] of fields) {
+    if (init != null && !usesThis(init)) litProps.push([':', fname, transform(init)])
+    else { litProps.push([':', fname, UNDEF]); if (init != null) deferred.push([fname, init]) }
+  }
+  for (const [mname, mparams, mbody] of methods)
+    litProps.push([':', mname, transform(['=>', mparams ?? ['()', null], block(renameThis(mbody, self))])])
+  const lit = ['{}', litProps.length === 0 ? null : litProps.length === 1 ? litProps[0] : [',', ...litProps]]
+  const stmts = [['let', ['=', self, lit]]]
+  // `this`-dependent field initializers run, in declaration order, before the ctor.
+  for (const [fname, init] of deferred)
+    stmts.push(['=', ['.', self, fname], transform(renameThis(init, self))])
+  if (ctorBody != null) {
+    let cb = transform(renameThis(ctorBody, self))
+    if (Array.isArray(cb) && cb[0] === '{}') cb = cb[1]
+    if (Array.isArray(cb) && cb[0] === ';') stmts.push(...cb.slice(1).filter(s => s != null))
+    else if (cb != null) stmts.push(cb)
+  }
+  stmts.push(['return', self])
+  return ['=>', arrowParams(ctorParams ?? ['()', null]), ['{}', [';', ...stmts]]]
+}
 
 const handlers = {
   // Named IIFE: (function name(p){b})(a) → let name = arrow; name(a)
@@ -282,6 +472,16 @@ const handlers = {
     }
     return arrow
   },
+
+  '=>'(params, body) {
+    const [p2, b2] = lowerArguments(params, body)
+    return ['=>', p2, transform(b2)]
+  },
+
+  // Class in expression position → its factory arrow. (A named class
+  // expression's own inner binding is dropped — rare; statement-form
+  // `class C {}` is handled by transformScope, which keeps the binding.)
+  'class'(name, heritage, body) { return lowerClass(name, heritage, body) },
 
   // `var` is hoisted away before transform reaches here. If one slips through
   // (e.g. raw subscript output without going via jzify entry/wrapArrowBody),
@@ -323,13 +523,25 @@ const handlers = {
   '!='(a, b) { return isProto(a) || isProto(b) ? 0 : ['!==', transform(a), transform(b)] },
   '==='(a, b) { if (isProto(a) || isProto(b)) return 1 },
   '!=='(a, b) { if (isProto(a) || isProto(b)) return 0 },
+  '?'(cond, yes, no) {
+    // subscript parses `[...cond ? a : b]` as `[(...cond) ? a : b]`.
+    // JS precedence means array spread should wrap the whole conditional:
+    // `[...(cond ? a : b)]`.
+    if (Array.isArray(cond) && cond[0] === '...')
+      return ['...', ['()', ['?', transform(cond[1]), transform(yes), transform(no)]]]
+  },
 
   // new → call (keep TypedArrays)
   'new'(ctor, ...cargs) {
+    if (Array.isArray(ctor) && ctor[0] === '()' && Array.isArray(ctor[1]) && ctor[1][0] === '.') {
+      return ['()', ['.', transform(['new', ctor[1][1]]), ctor[1][2]], ...ctor.slice(2).map(transform)]
+    }
     const name = typeof ctor === 'string' ? ctor : (Array.isArray(ctor) && ctor[0] === '()' ? ctor[1] : null)
-    if (typeof name === 'string' && TYPED_ARRAYS.has(name)) return ['new', transform(ctor), ...cargs.map(transform)]
+    if (typeof name === 'string' && (TYPED_ARRAYS.has(name) || name === 'Array')) return ['new', transform(ctor), ...cargs.map(transform)]
     if (Array.isArray(ctor) && ctor[0] === '()') return transform(ctor)
-    return ['()', transform(ctor), ...cargs.map(transform)]
+    // `new C(a)` → `C(a)`; `new C` (no parens) → `C()` — a 2-element `['()', X]`
+    // is grouping parens, so a no-arg call needs the explicit `null` arg slot.
+    return ['()', transform(ctor), ...(cargs.length ? cargs.map(transform) : [null])]
   },
 
   // instanceof → typeof / Array.isArray (jzify allows what strict mode prohibits)
@@ -363,9 +575,16 @@ const handlers = {
     if (Array.isArray(inner) && inner[0] === 'function' && inner[1]) {
       return ['export', hoistFnDecl(inner[1], inner[2], inner[3])]
     }
+    // `export class C {}` → `export let C = factory`; named class keeps its binding.
+    if (Array.isArray(inner) && inner[0] === 'class' && inner[1]) {
+      return ['export', ['let', ['=', inner[1], lowerClass(inner[1], inner[2], inner[3])]]]
+    }
     if (Array.isArray(inner) && inner[0] === 'default' && Array.isArray(inner[1]) && inner[1][0] === 'function' && inner[1][1]) {
       const decl = hoistFnDecl(inner[1][1], inner[1][2], inner[1][3])
       return [';', decl, ['export', ['default', inner[1][1]]]]
+    }
+    if (Array.isArray(inner) && inner[0] === 'default' && Array.isArray(inner[1]) && inner[1][0] === 'class' && inner[1][1]) {
+      return [';', ['let', ['=', inner[1][1], lowerClass(inner[1][1], inner[1][2], inner[1][3])]], ['export', ['default', inner[1][1]]]]
     }
     return ['export', transform(inner)]
   },
@@ -377,7 +596,137 @@ function transform(node) {
   const [op, ...args] = node
   if (op == null) return node
   const h = handlers[op]
-  return (h && h(...args)) ?? (h ? [op, ...args.map(transform)] : [op, ...args.map(transform)])
+  // A handler that returns nullish (including no `return`) means "no rewrite at
+  // this node" — fall through to a generic recurse. `??` (not `||`) so handlers
+  // like `'==='` can legitimately return `0`.
+  return (h && h(...args)) ?? [op, ...args.map(transform)]
+}
+
+// Esbuild emits a small ESM helper:
+//
+//   var __defProp = Object.defineProperty;
+//   var __export = (target, all) => {
+//     for (var name in all)
+//       __defProp(target, name, { get: all[name], enumerable: true });
+//   };
+//   __export(src_exports, { default: () => value });
+//   use(src_exports.default);
+//
+// Full descriptor/prototype semantics are outside JZ's fixed-shape object model.
+// This pass instead recognizes the static helper pattern and rewrites reads of
+// the synthetic export object to the real binding.
+function foldStaticExportHelpers(ast) {
+  const body = astSeq(ast)
+  if (!body) return ast
+
+  const defPropAliases = new Set()
+  for (const stmt of body) {
+    if (Array.isArray(stmt) && stmt[0] === '=' && typeof stmt[1] === 'string' && isObjectDefineProperty(stmt[2]))
+      defPropAliases.add(stmt[1])
+  }
+  if (!defPropAliases.size) return ast
+
+  const helperNames = new Set()
+  for (const stmt of body) {
+    if (Array.isArray(stmt) && stmt[0] === '=' && typeof stmt[1] === 'string' &&
+        Array.isArray(stmt[2]) && stmt[2][0] === '=>' && containsDefinePropertyCall(stmt[2], defPropAliases))
+      helperNames.add(stmt[1])
+  }
+  if (!helperNames.size) return ast
+
+  const rewrites = new Map()
+  const removable = new Set()
+  for (const stmt of body) {
+    const ex = staticExportCall(stmt, helperNames)
+    if (!ex) continue
+    for (const [key, value] of ex.props) rewrites.set(`${ex.target}.${key}`, value)
+    removable.add(stmt)
+  }
+  if (!rewrites.size) return ast
+
+  const rewritten = body
+    .filter(stmt => !removable.has(stmt) && !isDefPropAliasAssign(stmt, defPropAliases) && !isExportHelperAssign(stmt, helperNames))
+    .map(stmt => replaceStaticExportReads(stmt, rewrites))
+  return rewritten.length === 0 ? null : rewritten.length === 1 ? rewritten[0] : [';', ...rewritten]
+}
+
+function astSeq(ast) {
+  if (!Array.isArray(ast)) return null
+  return ast[0] === ';' ? ast.slice(1).filter(Boolean) : [ast]
+}
+
+function isObjectDefineProperty(node) {
+  return Array.isArray(node) && node[0] === '.' && node[1] === 'Object' && node[2] === 'defineProperty'
+}
+
+function isDefPropAliasAssign(stmt, aliases) {
+  return Array.isArray(stmt) && stmt[0] === '=' && aliases.has(stmt[1]) && isObjectDefineProperty(stmt[2])
+}
+
+function isExportHelperAssign(stmt, helpers) {
+  return Array.isArray(stmt) && stmt[0] === '=' && helpers.has(stmt[1])
+}
+
+function containsDefinePropertyCall(node, aliases) {
+  if (!Array.isArray(node)) return false
+  if (node[0] === '()' && (aliases.has(node[1]) || isObjectDefineProperty(node[1]))) return true
+  for (let i = 1; i < node.length; i++) if (containsDefinePropertyCall(node[i], aliases)) return true
+  return false
+}
+
+function staticExportCall(stmt, helpers) {
+  if (!Array.isArray(stmt) || stmt[0] !== '()' || !helpers.has(stmt[1])) return null
+  const args = callArgs(stmt.slice(2))
+  if (args.length !== 2 || typeof args[0] !== 'string') return null
+  const props = objectProps(args[1])
+  if (!props) return null
+  const out = []
+  for (const prop of props) {
+    if (!Array.isArray(prop) || prop[0] !== ':' || typeof prop[1] !== 'string') return null
+    const value = getterReturnExpr(prop[2])
+    if (!value) return null
+    out.push([prop[1], value])
+  }
+  return { target: args[0], props: out }
+}
+
+function callArgs(args) {
+  if (args.length === 1 && Array.isArray(args[0]) && args[0][0] === ',') return args[0].slice(1)
+  return args.filter(a => a != null)
+}
+
+function objectProps(node) {
+  if (!Array.isArray(node) || node[0] !== '{}') return null
+  const body = node[1]
+  if (body == null) return []
+  if (Array.isArray(body) && body[0] === ',') return body.slice(1)
+  return [body]
+}
+
+function getterReturnExpr(node) {
+  if (!Array.isArray(node) || node[0] !== '=>') return null
+  const params = paramList(node[1])
+  if (params.length !== 0) return null
+  const body = node[2]
+  if (Array.isArray(body) && body[0] === '{}' && Array.isArray(body[1]) && body[1][0] === 'return') return body[1][1]
+  if (Array.isArray(body) && body[0] === 'return') return body[1]
+  return body
+}
+
+function replaceStaticExportReads(node, rewrites) {
+  if (node == null || typeof node !== 'object' || !Array.isArray(node)) return node
+  if ((node[0] === '.' || node[0] === '?.') && typeof node[1] === 'string' && typeof node[2] === 'string') {
+    const value = rewrites.get(`${node[1]}.${node[2]}`)
+    if (value) return cloneAst(value)
+  }
+  if (node[0] === ':') return [node[0], node[1], replaceStaticExportReads(node[2], rewrites)]
+  return node.map((part, i) => i === 0 ? part : replaceStaticExportReads(part, rewrites))
+}
+
+function cloneAst(node) {
+  if (node == null || typeof node !== 'object') return node
+  if (!Array.isArray(node)) return node
+  return node.map(cloneAst)
 }
 
 /** Transform switch statement to if/else chain. */
@@ -402,174 +751,4 @@ function transformSwitch(discriminant, cases) {
   }
   if (chain) stmts.push(chain)
   return [';', ...stmts]
-}
-
-// === AST → jz source codegen ===
-
-const INDENT = '  '
-const prec = { '=': 1, '+=': 1, '-=': 1, '*=': 1, '/=': 1, '%=': 1, '&=': 1, '|=': 1, '^=': 1, '>>=': 1, '<<=': 1, '>>>=': 1, '||=': 1, '&&=': 1,
-  '??': 2, '||': 3, '&&': 4, '|': 5, '^': 6, '&': 7, '===': 8, '!==': 8, '==': 8, '!=': 8,
-  '<': 9, '>': 9, '<=': 9, '>=': 9, '<<': 10, '>>': 10, '>>>': 10,
-  '+': 11, '-': 11, '*': 12, '/': 12, '%': 12, '**': 13 }
-
-/** Wrap statement in { } if not already a block */
-function wrapBlock(node, depth) {
-  if (Array.isArray(node) && node[0] === '{}') return codegen(node, depth)
-  return '{ ' + codegen(node, depth) + '; }'
-}
-
-/** Generate jz source from AST. Enforces semicolons. */
-export function codegen(node, depth = 0) {
-  if (node == null) return ''
-  if (typeof node === 'number') return String(node)
-  if (typeof node === 'bigint') return node + 'n'
-  if (typeof node === 'string') return node
-  if (!Array.isArray(node)) return String(node)
-
-  const [op, ...a] = node
-  const ind = INDENT.repeat(depth), ind1 = INDENT.repeat(depth + 1)
-
-  // Literal: [, value]
-  if (op == null) return typeof a[0] === 'string' ? JSON.stringify(a[0]) : a[0] == null ? 'null' : String(a[0]) + (typeof a[0] === 'bigint' ? 'n' : '')
-
-  // Statements
-  if (op === ';') return a.map(s => codegen(s, depth)).filter(Boolean).join(';\n' + ind) + ';'
-  if (op === '{}') {
-    // Discriminate object literal / destructuring pattern from block.
-    // Object: `:` key-value, `,` of object-pattern items (id / `:` / `...` / `= default`),
-    //         lone string shorthand. Empty `{}` outputs the same string either way.
-    const body = a[0]
-    const isObjItem = (n) => typeof n === 'string' ||
-      (Array.isArray(n) && (n[0] === ':' || n[0] === '...' || n[0] === 'as' ||
-        (n[0] === '=' && typeof n[1] === 'string')))
-    const isObj = body == null ? false
-      : typeof body === 'string' ? true
-      : Array.isArray(body) && (body[0] === ':' || body[0] === '...' || body[0] === 'as' ||
-          (body[0] === ',' && body.slice(1).every(isObjItem)))
-    if (isObj) {
-      if (typeof body === 'string') return '{ ' + body + ' }'
-      if (body[0] === ',') return '{ ' + body.slice(1).map(x => codegen(x)).join(', ') + ' }'
-      return '{ ' + codegen(body) + ' }'
-    }
-    // Block: body is null, a single statement, or [';', ...stmts]
-    const stmts = body == null ? [] : (Array.isArray(body) && body[0] === ';' ? body.slice(1) : [body])
-    const rendered = stmts.map(s => codegen(s, depth + 1)).filter(Boolean).join(';\n' + ind1)
-    return '{\n' + ind1 + rendered + (rendered ? ';' : '') + '\n' + ind + '}'
-  }
-
-  // Declarations
-  if (op === 'let' || op === 'const') return op + ' ' + a.map(d => codegen(d, depth)).join(', ')
-  if (op === 'export') { const inner = codegen(a[0], depth); return inner ? 'export ' + inner : '' }
-  if (op === 'default') return 'default ' + codegen(a[0], depth)
-
-  // Control flow
-  if (op === 'if') {
-    const cond = codegen(a[0]), then = wrapBlock(a[1], depth)
-    return a[2] != null
-      ? 'if (' + cond + ') ' + then + ' else ' + wrapBlock(a[2], depth)
-      : 'if (' + cond + ') ' + then
-  }
-  if (op === 'while') return 'while (' + codegen(a[0]) + ') ' + wrapBlock(a[1], depth)
-  if (op === 'for') {
-    if (a.length === 2) { // ['for', head, body] — subscript shape
-      const [head, body] = a
-      if (Array.isArray(head) && (head[0] === 'of' || head[0] === 'in'))
-        return 'for (' + codegen(head[1]) + ' ' + head[0] + ' ' + codegen(head[2]) + ') ' + wrapBlock(body, depth)
-      // ['let'/'const', ['in'/'of', name, obj]] — subscript wraps var→let around in/of
-      if (Array.isArray(head) && (head[0] === 'let' || head[0] === 'const') && Array.isArray(head[1]) && (head[1][0] === 'in' || head[1][0] === 'of'))
-        return 'for (' + head[0] + ' ' + codegen(head[1][1]) + ' ' + head[1][0] + ' ' + codegen(head[1][2]) + ') ' + wrapBlock(body, depth)
-      // C-style head [';', init, cond, update] is positional — empty slots are valid,
-      // must not flow through the generic `;` joiner (which adds newlines + a trailing `;`).
-      if (Array.isArray(head) && head[0] === ';')
-        return 'for (' + (head[1] == null ? '' : codegen(head[1])) + '; ' + (head[2] == null ? '' : codegen(head[2])) + '; ' + (head[3] == null ? '' : codegen(head[3])) + ') ' + wrapBlock(body, depth)
-      return 'for (' + codegen(head) + ') ' + wrapBlock(body, depth)
-    }
-    return 'for (' + (codegen(a[0]) || '') + '; ' + (codegen(a[1]) || '') + '; ' + (codegen(a[2]) || '') + ') ' + wrapBlock(a[3], depth)
-  }
-  if (op === 'return') return 'return ' + codegen(a[0])
-  if (op === 'throw') return 'throw ' + codegen(a[0])
-  if (op === 'break') return 'break'
-  if (op === 'continue') return 'continue'
-  // catch with optional binding: ['catch', tryBlock, catchBody] or ['catch', tryBlock, paramName, catchBody]
-  if (op === 'catch') {
-    if (a.length === 3) return 'try ' + codegen(a[0], depth) + ' catch (' + a[1] + ') ' + codegen(a[2], depth)
-    return 'try ' + codegen(a[0], depth) + ' catch ' + codegen(a[1], depth)
-  }
-
-  // Arrow
-  if (op === '=>') {
-    // Params: already wrapped in () by parser, or bare name
-    const p = a[0]
-    const params = Array.isArray(p) && p[0] === '()' ? codegen(p) : '(' + codegen(p) + ')'
-    const body = a[1]
-    const isBlock = Array.isArray(body) && (body[0] === '{}' || body[0] === ';' || body[0] === 'return')
-    const bodyStr = Array.isArray(body) && body[0] !== '{}' && isBlock
-      ? '{ ' + codegen(body, depth) + '; }'
-      : codegen(body, depth)
-    return params + ' => ' + bodyStr
-  }
-
-  // Grouping parens / function call
-  if (op === '()') {
-    if (a.length === 1) return '(' + (a[0] == null ? '' : codegen(a[0])) + ')'
-    return codegen(a[0]) + '(' + a.slice(1).map(x => codegen(x)).join(', ') + ')'
-  }
-
-  // Property access
-  if (op === '.') return codegen(a[0]) + '.' + a[1]
-  if (op === '?.') return codegen(a[0]) + '?.' + a[1]
-  if (op === '?.[]') return codegen(a[0]) + '?.[' + codegen(a[1]) + ']'
-  if (op === '?.()') return codegen(a[0]) + '?.(' + a.slice(1).map(x => codegen(x)).join(', ') + ')'
-  if (op === '[]') {
-    // Array literal: ['[]', body] (length 2 → a.length 1). body may be null (empty),
-    // a single element, or a [',', ...items] sequence.
-    if (a.length === 1) {
-      if (a[0] == null) return '[]'
-      const body = a[0]
-      if (Array.isArray(body) && body[0] === ',') return '[' + body.slice(1).map(x => codegen(x)).join(', ') + ']'
-      return '[' + codegen(body) + ']'
-    }
-    // Subscript: ['[]', obj, idx]
-    return codegen(a[0]) + '[' + codegen(a[1]) + ']'
-  }
-  if (op === ':') return codegen(a[0]) + ': ' + codegen(a[1])
-  if (op === 'str') return JSON.stringify(a[0])
-  if (op === '//') return '/' + a[0] + '/' + (a[1] || '')
-
-  // Comma
-  if (op === ',') return a.map(x => codegen(x)).join(', ')
-  // Template literal: alternating string/expr parts. String parts are [null, "str"], expr parts are AST nodes.
-  if (op === '`') return '`' + a.map(p => {
-    if (Array.isArray(p) && p[0] == null && typeof p[1] === 'string') return p[1].replace(/[`\\$]/g, c => '\\' + c)
-    return '${' + codegen(p) + '}'
-  }).join('') + '`'
-
-  // Spread
-  if (op === '...') return '...' + codegen(a[0])
-
-  // Import / export rename
-  if (op === 'import') return 'import ' + codegen(a[0])
-  if (op === 'from') return codegen(a[0]) + ' from ' + codegen(a[1])
-  if (op === 'as') return codegen(a[0]) + ' as ' + codegen(a[1])
-
-  // Unary prefix
-  if (a.length === 1) {
-    if (op === '++' || op === '--') return a[0] == null ? op : op + codegen(a[0])
-    if (op === 'typeof') return 'typeof ' + codegen(a[0])
-    if (op === 'u-') return '-' + codegen(a[0])
-    if (op === 'u+') return '+' + codegen(a[0])
-    return op + codegen(a[0])
-  }
-
-  // Postfix
-  if (a.length === 2 && a[1] === null) return codegen(a[0]) + op
-
-  // Binary
-  if (a.length === 2 && prec[op]) return codegen(a[0]) + ' ' + op + ' ' + codegen(a[1])
-
-  // Ternary
-  if (op === '?' || op === '?:') return codegen(a[0]) + ' ? ' + codegen(a[1]) + ' : ' + codegen(a[2])
-
-  // Fallback
-  return op + '(' + a.map(x => codegen(x)).join(', ') + ')'
 }

@@ -680,6 +680,7 @@ test('perf: watr WAT compiler — WASM competitive with JS', async () => {
   const watrSrc = (file) => readFileSync(new URL(`../node_modules/watr/src/${file}`, import.meta.url), 'utf8')
   const ENTRY = {
     './src/compile.js': watrSrc('compile.js'),
+    './compile.js':     watrSrc('compile.js'),
     './src/parse.js':   watrSrc('parse.js'),
     './src/print.js':   watrSrc('print.js'),
     './src/polyfill.js':watrSrc('polyfill.js'),
@@ -863,7 +864,7 @@ const golden = (name, src, expected) => test(`golden size: ${name}`, () => {
     `${name}: expected ${expected}±${tol} bytes, got ${actual}`)
 })
 
-golden('known-shape object', 'export let f = (x) => { let p = { x: x, y: x * 2, z: x + 1 }; return p.x + p.y + p.z }', 4387)
+golden('known-shape object', 'export let f = (x) => { let p = { x: x, y: x * 2, z: x + 1 }; return p.x + p.y + p.z }', 4300)
 golden('unknown/dynamic object', 'export let f = (k) => { let p = {}; p[k] = 1; p.b = 2; return p[k] + p.b }', 7385)
 golden('closure-heavy parser', `export let f = (s) => {
   let i = 0, n = s.length
@@ -873,10 +874,10 @@ golden('closure-heavy parser', `export let f = (s) => {
   let total = 0
   while (i < n) { let c = next(); if (isDigit(c)) total = total * 10 + (c.charCodeAt(0) - 48) }
   return total
-}`, 3235)
+}`, 3410)
 golden('typed-array loop', `export let f = (arr) => {
   let buf = new Float64Array(arr)
   let s = 0
   for (let i = 0; i < buf.length; i++) s += buf[i] * 2
   return s
-}`, 1022)
+}`, 1050)

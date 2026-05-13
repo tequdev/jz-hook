@@ -865,10 +865,7 @@ export const emitter = {
   ';': (...args) => {
     const out = []
     for (const a of args) {
-      const r = emit(a, 'void')
-      if (r == null) continue
-      out.push(...flat(r))
-      if (r?.type && r.type !== 'void') out.push('drop')
+      out.push(...emitFlat(a))
     }
     return out
   },
@@ -2335,11 +2332,18 @@ export const emitter = {
       // legitimate 0-arity callee isn't bypassed.
       const args = parsed.normal.map((a, k) => emitArgForParam(emit(a), func?.sig.params[k]))
       const expected = func?.sig.params.length ?? args.length
-      while (args.length < expected) args.push(func?.sig.params[args.length]?.type === 'i32' ? typed(['i32.const', 0], 'i32') : undefExpr())
+      while (args.length < expected) {
+        const param = func?.sig.params[args.length]
+        args.push(param?.type === 'i32' ? typed(['i32.const', 0], 'i32') : emitArgForParam(undefExpr(), param))
+      }
       if (args.length > expected) args.length = expected
       // Multi-value return: materialize as heap array (caller expects single pointer)
       if (func?.sig.results.length > 1) return materializeMulti(['()', callee, ...parsed.normal])
-      const callIR = typed(['call', `$${callee}`, ...args], func?.sig.results[0] || 'f64')
+      const callNode = ['call', `$${callee}`, ...args]
+      const isImportFunc = ctx.module.imports?.some(i =>
+        Array.isArray(i) && i[0] === 'import' && i[3]?.[0] === 'func' && i[3]?.[1] === `$${callee}`)
+      if (isImportFunc && func?.sig.results[0] === 'i64' && ctx.transform.host !== 'hook') return fromI64(callNode)
+      const callIR = typed(callNode, func?.sig.results[0] || 'f64')
       if (func?.sig.ptrKind != null) callIR.ptrKind = func.sig.ptrKind
       if (func?.sig.ptrAux != null) callIR.ptrAux = func.sig.ptrAux
       return callIR
@@ -2392,12 +2396,34 @@ export const emitter = {
         calleeArity = n
       }
     }
-    const emittedArgs = argList.map(a => asF64(emit(a)))
+    let importResult = null
+    let importParamTypes = null
+    if (typeof callee === 'string') {
+      const imp = ctx.module.imports?.find(i =>
+        Array.isArray(i) && i[0] === 'import' && i[3]?.[0] === 'func' && i[3]?.[1] === `$${callee}`)
+      if (imp) {
+        importParamTypes = []
+        for (let k = 2; k < imp[3].length; k++) {
+          const part = imp[3][k]
+          if (Array.isArray(part) && part[0] === 'param') importParamTypes.push(part[1])
+          else if (Array.isArray(part) && part[0] === 'result') importResult = part[1]
+        }
+      }
+    }
+    const emittedArgs = argList.map((a, idx) => {
+      const e = emit(a)
+      return importParamTypes ? asParamType(e, importParamTypes[idx] || 'f64') : asF64(e)
+    })
     if (calleeArity != null) {
-      while (emittedArgs.length < calleeArity) emittedArgs.push(undefExpr())
+      while (emittedArgs.length < calleeArity) {
+        const t = importParamTypes?.[emittedArgs.length] || 'f64'
+        emittedArgs.push(asParamType(undefExpr(), t))
+      }
       if (emittedArgs.length > calleeArity) emittedArgs.length = calleeArity
     }
-    return typed(['call', `$${callee}`, ...emittedArgs], 'f64')
+    const call = ['call', `$${callee}`, ...emittedArgs]
+    if (importResult === 'i64' && ctx.transform.host !== 'hook') return fromI64(call)
+    return typed(call, importResult || 'f64')
   },
 }
 
@@ -2459,7 +2485,10 @@ function liftOptionalChain(node) {
  */
 export function emit(node, expect) {
   _expect = expect || null
-  if (Array.isArray(node) && node.loc != null) ctx.error.loc = node.loc
+  if (Array.isArray(node)) {
+    ctx.error.node = node
+    if (node.loc != null) ctx.error.loc = node.loc
+  }
   if (node == null) return null
   if (node === true) return typed(['i32.const', 1], 'i32')
   if (node === false) return typed(['i32.const', 0], 'i32')

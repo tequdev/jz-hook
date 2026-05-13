@@ -78,6 +78,68 @@ test('regression: non-ASCII identifier (test262 start-unicode-*)', () => {
   is(exports._run(), 1, 'non-ASCII identifier works correctly')
 })
 
+test('regression: jzify hoists var initializer assignment', () => {
+  const exports = run(`export let _run = () => { var x = 1; return x }`)
+  is(exports._run(), 1, 'var initializer compiles as assignment to the declared name')
+})
+
+test('regression: jzify hoists for-var-in declaration', () => {
+  const exports = run(`export let _run = () => {
+    let o = { a: 1, b: 2 }
+    let n = 0
+    for (var k in o) n += 1
+    return n
+  }`)
+  is(exports._run(), 2, 'for (var k in obj) compiles')
+})
+
+test('regression: jzify preserves new Array length constructor', () => {
+  const exports = run(`export let _run = () => {
+    let a = new Array(4)
+    return a.length
+  }`)
+  is(exports._run(), 4, 'new Array(n) allocates expected length')
+
+  const wasm = compile(`export let _run = () => {
+    let a = new Array(4).fill(2)
+    return a.length + a[0]
+  }`, { jzify: true })
+  ok(wasm.byteLength > 0, 'new Array(n).fill(...) compiles through jzify')
+})
+
+test('regression: jzify lowers destructured arrow params with expression object body', () => {
+  const exports = run(`export let _run = () =>
+    [[1, 2]].map(([a, b]) => ({ sum: a + b }))[0].sum
+  `)
+  is(exports._run(), 3, 'destructured arrow callback returning object literal compiles')
+})
+
+test('regression: jzify folds static esbuild export helper', () => {
+  const exports = run(`
+    var __defProp = Object.defineProperty;
+    var __export = (target, all) => {
+      for (var name in all)
+        __defProp(target, name, { get: all[name], enumerable: true });
+    };
+    var src_exports = {};
+    __export(src_exports, { default: () => mod_default });
+    function impl() { return 42 }
+    var mod_default = impl;
+    export let _run = () => src_exports?.default();
+  `)
+  is(exports._run(), 42, 'static export object reads rewrite to the live local binding')
+})
+
+test('regression: jzify groups conditional array spread', () => {
+  const exports = run(`export let _run = () => {
+    let yes = [1, 2]
+    let no = [3]
+    let out = [...true ? yes : no]
+    return out.length + out[1]
+  }`)
+  is(exports._run(), 4, 'array spread conditional compiles as [...(cond ? a : b)]')
+})
+
 test('regression: for-in with let as identifier (test262 identifier-let-allowed)', () => {
   const exports = run(`export let _run = () => { for (let in {}) {} return 1 }`)
   is(exports._run(), 1, 'for-in with let as identifier compiles and runs')
@@ -161,4 +223,37 @@ test('test262 arguments object: default initializer can reference arguments', ()
     return ref() + ref(7) * 10
   }`)
   is(exports._run(), 70, 'arguments in default params triggers rest-arguments lowering')
+})
+
+test('test262 redeclaration: function declaration followed by var of the same name', () => {
+  // `function f() {} var f;` is legal JS — the `var` is a no-op redeclaration.
+  // jzify lowers `function`→`const` and `var`→`let`; without dedup that emitted two
+  // bindings for one slot and a typed-slot clash in codegen.
+  const exports = run(`export let _run = () => { function f() { return 42 } var f; return f() }`)
+  is(exports._run(), 42, 'var redeclaration after function declaration is dropped')
+})
+
+test('test262 redeclaration: var of a name later (re)declared as a function', () => {
+  const exports = run(`export let _run = () => { var f; function f() { return 9 } return f() }`)
+  is(exports._run(), 9, 'function declaration wins over an earlier bare var')
+})
+
+test('test262 redeclaration: repeated var keeps the first initializer', () => {
+  const exports = run(`export let _run = () => { var x = 3; var x; return x }`)
+  is(exports._run(), 3, 'a bare `var x` after `var x = 3` does not clobber the value')
+})
+
+test('test262 arguments object: `var arguments` is an ordinary local, not the implicit object', () => {
+  const exports = run(`export let _run = () => { var arguments; arguments = 7; return arguments }`)
+  is(exports._run(), 7, '`var arguments` shadows the implicit object — no rest param synthesized')
+})
+
+test('test262 arguments object: `let arguments` initializer is honored', () => {
+  const exports = run(`export let _run = () => { let arguments = 5; return arguments + 1 }`)
+  is(exports._run(), 6, '`let arguments` is a plain lexical binding')
+})
+
+test('test262 arguments object: implicit arguments still works alongside an unrelated function', () => {
+  const exports = run(`export let _run = () => { let g = function(){ return arguments.length }; return g(1,2,3) }`)
+  is(exports._run(), 3, 'a body without an `arguments` declaration keeps the implicit object')
 })

@@ -24,13 +24,36 @@
  */
 
 import { ctx } from './ctx.js'
-import { T, VAL, ASSIGN_OPS, analyzeBody, invalidateLocalsCache, staticObjectProps, staticPropertyKey, valTypeOf, typedElemCtor, typedElemAux, updateGlobalRep, collectProgramFacts } from './analyze.js'
+import { T, VAL, ASSIGN_OPS, analyzeBody, invalidateLocalsCache, staticObjectProps, staticPropertyKey, valTypeOf, typedElemCtor, typedElemAux, updateGlobalRep, collectProgramFacts, extractParams } from './analyze.js'
 import { MAX_CLOSURE_ARITY } from './ir.js'
 import narrowSignatures, { specializeBimorphicTyped, refineDynKeys } from './narrow.js'
 
 const CONTROL_TRANSFER = new Set(['return', 'throw', 'break', 'continue'])
 const LOOP_OPS = new Set(['for', 'while', 'do', 'do-while'])
-const SCALAR_TYPED_CTOR = 'new.Float64Array'
+// Fixed-size typed arrays eligible for scalar replacement, mapped to the element
+// store-coercion kind ('' = none, i.e. Float64Array's f64-identity). Excluded:
+//   Float32Array      — store coercion is `Math.fround`, needs the `math` module pulled at plan time
+//   Uint32Array       — element range [0, 2^32) exceeds what jz keeps as f64 after `x >>> 0` (i32-narrowed)
+//   Uint8ClampedArray — round-half-to-even clamp
+// Coerced (truthy) types are scalarized only when fully local — any escape (passed
+// to a call, `.buffer`/view aliasing, etc.) keeps the real allocation, since the
+// mirror/fence path can't track writes through an alias that outlives the fence.
+const SCALAR_TYPED_COERCE = {
+  'new.Float64Array': '',
+  'new.Int32Array': 'i32',
+  'new.Int16Array': 'i16', 'new.Uint16Array': 'u16',
+  'new.Int8Array': 'i8', 'new.Uint8Array': 'u8',
+}
+// AST for the store coercion a typed-array element does on write (`arr[i] = v`).
+// All expressible with operators jz already lowers post-plan (no module deps).
+const coerceAST = (kind, expr) => {
+  if (kind === 'i32') return ['|', expr, [null, 0]]
+  if (kind === 'i16') return ['>>', ['<<', expr, [null, 16]], [null, 16]]
+  if (kind === 'u16') return ['&', expr, [null, 0xffff]]
+  if (kind === 'i8') return ['>>', ['<<', expr, [null, 24]], [null, 24]]
+  if (kind === 'u8') return ['&', expr, [null, 0xff]]
+  return expr
+}
 const maxScalarTypedArrayLen = () => ctx.transform.optimize?.scalarTypedArrayLen ?? 32
 const maxScalarTypedLoopUnroll = () => ctx.transform.optimize?.scalarTypedLoopUnroll ?? 16
 const maxScalarTypedNestedUnroll = () => ctx.transform.optimize?.scalarTypedNestedUnroll ?? 128
@@ -164,12 +187,14 @@ const scalarObjectProps = (expr) => {
   return props
 }
 
-const fixedScalarTypedArrayLen = (expr) => {
-  if (typedElemCtor(expr) !== SCALAR_TYPED_CTOR) return null
+const fixedScalarTypedArray = (expr) => {
+  const ctor = typedElemCtor(expr)
+  if (ctor == null || !(ctor in SCALAR_TYPED_COERCE)) return null
   const args = callArgs(expr)
   if (!args || args.length !== 1) return null
   const len = constIntExpr(args[0])
-  return len != null && len >= 0 && len <= maxScalarTypedArrayLen() ? len : null
+  return len != null && len >= 0 && len <= maxScalarTypedArrayLen()
+    ? { len, coerce: SCALAR_TYPED_COERCE[ctor] } : null
 }
 
 const ASSIGN_TARGET_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '>>=', '<<=', '>>>=', '||=', '&&=', '??='])
@@ -253,7 +278,10 @@ const typedArraySlotIndex = (node, len) => {
   return idx != null && idx >= 0 && idx < len ? idx : null
 }
 
-const safeScalarTypedArrayUse = (node, name, len) => {
+// `coerce` truthy ⇒ the array's element type truncates on store (Int*/Uint* views),
+// so in-place updates (`arr[i]++`, `arr[i] += x`) can't be a plain `slot`-op rewrite —
+// reject them and only scalarize plain `arr[i] = v` writes and `arr[i]` reads.
+const safeScalarTypedArrayUse = (node, name, len, coerce = '') => {
   if (typeof node === 'string') return node !== name
   if (!Array.isArray(node)) return true
   const op = node[0]
@@ -261,17 +289,18 @@ const safeScalarTypedArrayUse = (node, name, len) => {
   if ((op === '.' || op === '?.') && node[1] === name) return node[2] === 'length'
   if (op === '[]' && node[1] === name) return typedArraySlotIndex(node[2], len) != null
   if ((op === '++' || op === '--') && Array.isArray(node[1]) && node[1][0] === '[]' && node[1][1] === name)
-    return typedArraySlotIndex(node[1][2], len) != null
+    return !coerce && typedArraySlotIndex(node[1][2], len) != null
   if (ASSIGN_TARGET_OPS.has(op)) {
     if (node[1] === name) return false
     if (Array.isArray(node[1]) && node[1][0] === '[]' && node[1][1] === name) {
+      if (coerce && op !== '=') return false
       if (typedArraySlotIndex(node[1][2], len) == null) return false
-      for (let i = 2; i < node.length; i++) if (!safeScalarTypedArrayUse(node[i], name, len)) return false
+      for (let i = 2; i < node.length; i++) if (!safeScalarTypedArrayUse(node[i], name, len, coerce)) return false
       return true
     }
   }
   if (op === '...' && node[1] === name) return false
-  for (let i = 1; i < node.length; i++) if (!safeScalarTypedArrayUse(node[i], name, len)) return false
+  for (let i = 1; i < node.length; i++) if (!safeScalarTypedArrayUse(node[i], name, len, coerce)) return false
   return true
 }
 
@@ -296,8 +325,11 @@ const rewriteScalarTypedArrayUses = (node, arrays) => {
     return slot ? [op, slot] : node
   }
   if (ASSIGN_TARGET_OPS.has(op) && Array.isArray(node[1]) && node[1][0] === '[]' && arrays.has(node[1][1])) {
-    const slot = slotFor(node[1][2], arrays.get(node[1][1]))
-    return slot ? [op, slot, ...node.slice(2).map(part => rewriteScalarTypedArrayUses(part, arrays))] : node
+    const entry = arrays.get(node[1][1])
+    const slot = slotFor(node[1][2], entry)
+    if (!slot) return node
+    const rhs = node.slice(2).map(part => rewriteScalarTypedArrayUses(part, arrays))
+    return op === '=' && entry.coerce ? ['=', slot, coerceAST(entry.coerce, rhs[0])] : [op, slot, ...rhs]
   }
   return node.map((part, i) => i === 0 ? part : rewriteScalarTypedArrayUses(part, arrays))
 }
@@ -362,26 +394,27 @@ const scalarizeTypedArrayLiteralSeq = (seq) => {
     if (!Array.isArray(stmt) || (stmt[0] !== 'let' && stmt[0] !== 'const') || stmt.length !== 2) continue
     const decl = stmt[1]
     if (!Array.isArray(decl) || decl[0] !== '=' || typeof decl[1] !== 'string') continue
-    const len = fixedScalarTypedArrayLen(decl[2])
-    if (len == null) continue
+    const fixed = fixedScalarTypedArray(decl[2])
+    if (fixed == null) continue
+    const { len, coerce } = fixed
     let hasSafeUse = false, hasUnsafeUse = false
     for (let j = 0; j < stmts.length; j++) {
       if (j === i) continue
       if (!mentionsName(stmts[j], decl[1])) continue
-      const safe = safeScalarTypedArrayUse(stmts[j], decl[1], len)
+      const safe = safeScalarTypedArrayUse(stmts[j], decl[1], len, coerce)
       hasSafeUse ||= safe
       hasUnsafeUse ||= !safe
     }
-    if (!hasSafeUse && hasUnsafeUse) continue
-    if (!hasUnsafeUse) candidates.set(decl[1], { index: i, len, mirrored: false })
-    else mirrored.set(decl[1], { index: i, len, mirrored: true })
+    if (hasUnsafeUse && (!hasSafeUse || coerce)) continue
+    if (!hasUnsafeUse) candidates.set(decl[1], { index: i, len, coerce, mirrored: false })
+    else mirrored.set(decl[1], { index: i, len, coerce, mirrored: true })
   }
   if (!candidates.size && !mirrored.size) return { node: changed ? [';', ...stmts] : seq, changed }
 
   const arrays = new Map()
   for (const [name, c] of [...candidates, ...mirrored]) {
     const slots = Array.from({ length: c.len }, (_, k) => `${name}${T}ta${ctx.func.uniq++}_${k}`)
-    arrays.set(name, { len: c.len, slots, mirrored: c.mirrored })
+    arrays.set(name, { len: c.len, slots, mirrored: c.mirrored, coerce: c.coerce })
   }
 
   const out = []
@@ -403,7 +436,7 @@ const scalarizeTypedArrayLiteralSeq = (seq) => {
     }
     const unsafe = []
     for (const [name, arr] of arrays) {
-      if (arr.mirrored && mentionsName(stmts[i], name) && !safeScalarTypedArrayUse(stmts[i], name, arr.len)) unsafe.push([name, arr])
+      if (arr.mirrored && mentionsName(stmts[i], name) && !safeScalarTypedArrayUse(stmts[i], name, arr.len, arr.coerce)) unsafe.push([name, arr])
     }
     if (unsafe.length) {
       for (const [name, arr] of unsafe) out.push(...scalarTypedArrayStores(name, arr))
@@ -528,8 +561,8 @@ const fixedTypedArraysInBody = (body) => {
       for (let i = 1; i < node.length; i++) {
         const d = node[i]
         if (!Array.isArray(d) || d[0] !== '=' || typeof d[1] !== 'string') continue
-        const len = fixedScalarTypedArrayLen(d[2])
-        if (len != null) out.set(d[1], { len })
+        const fixed = fixedScalarTypedArray(d[2])
+        if (fixed != null) out.set(d[1], fixed)
       }
     }
     for (let i = 1; i < node.length; i++) walk(node[i])
@@ -545,15 +578,15 @@ const scalarTypedParamCandidates = (func, sites, fixedByFunc) => {
   const cands = new Map()
   for (let i = 0; i < params.length; i++) {
     const pname = params[i].name
-    let len = null, ok = true
+    let len = null, coerce = null, ok = true
     for (const site of sites) {
       const arg = site.argList[i]
       const fixed = typeof arg === 'string' ? fixedByFunc.get(site.callerFunc)?.get(arg) : null
       if (!fixed) { ok = false; break }
-      if (len == null) len = fixed.len
-      else if (len !== fixed.len) { ok = false; break }
+      if (len == null) { len = fixed.len; coerce = fixed.coerce }
+      else if (len !== fixed.len || coerce !== fixed.coerce) { ok = false; break }
     }
-    if (ok && len != null && len <= maxScalarTypedArrayLen()) cands.set(pname, { len })
+    if (ok && len != null && len <= maxScalarTypedArrayLen()) cands.set(pname, { len, coerce })
   }
   if (!cands.size) return cands
   for (const site of sites) {
@@ -569,13 +602,14 @@ const scalarTypedParamCandidates = (func, sites, fixedByFunc) => {
 }
 
 const scalarizeTypedArrayParams = (func, paramCands) => {
-  for (const [name, c] of [...paramCands]) if (!safeScalarTypedArrayUse(func.body, name, c.len)) paramCands.delete(name)
+  for (const [name, c] of [...paramCands]) if (!safeScalarTypedArrayUse(func.body, name, c.len, c.coerce)) paramCands.delete(name)
   for (const [name] of [...paramCands]) if (!hasScalarTypedArrayRead(func.body, name)) paramCands.delete(name)
   if (!paramCands.size) return { body: func.body, changed: false }
   const arrays = new Map()
   for (const [name, c] of paramCands) {
     arrays.set(name, {
       len: c.len,
+      coerce: c.coerce,
       slots: Array.from({ length: c.len }, (_, k) => `${name}${T}tap${ctx.func.uniq++}_${k}`),
     })
   }
@@ -1070,6 +1104,146 @@ const inlineHotInternalCalls = (programFacts, ast) => {
   return changed
 }
 
+// === Inline non-escaping local lambdas ===
+// `const f = (a) => …; … f(x) …` → the lambda body substituted at each call
+// site. A non-escaping lambda's captured free vars are still in lexical scope at
+// the call site, so splicing the body in place preserves capture-by-reference
+// semantics while eliminating the closure object (no env pointer, no NaN-box, no
+// call_indirect). Mirrors inlineHotInternalCalls, scoped to one function body.
+
+// True iff `name` appears textually anywhere in `node` (descending into nested
+// arrows; `.prop` / `:key` positions are literal names, not refs — skipped to
+// match cloneWithSubst's structure).
+const referencesName = (node, name) => {
+  if (typeof node === 'string') return node === name
+  if (!Array.isArray(node)) return false
+  const op = node[0]
+  if (op === 'str') return false
+  if (op === '.' || op === '?.') return referencesName(node[1], name)
+  if (op === ':') return referencesName(node[2], name)
+  for (let i = 1; i < node.length; i++) if (referencesName(node[i], name)) return true
+  return false
+}
+
+// True iff every textual reference to `name` in `node` is the callee of a
+// `name(...)` call (i.e. the binding never escapes — never read as a value,
+// reassigned, captured by a nested lambda, or shadowed).
+const onlyCalledNotReferenced = (node, name) => {
+  if (typeof node === 'string') return node !== name
+  if (!Array.isArray(node)) return true
+  const op = node[0]
+  if (op === 'str') return true
+  // A nested lambda touching `name` at all (capture or shadowing param) → bail.
+  if (op === '=>') return !referencesName(node[1], name) && !referencesName(node[2], name)
+  if (op === '()' && node[1] === name) {
+    for (let i = 2; i < node.length; i++) if (!onlyCalledNotReferenced(node[i], name)) return false
+    return true
+  }
+  if (op === '.' || op === '?.') return onlyCalledNotReferenced(node[1], name)
+  if (op === ':') return onlyCalledNotReferenced(node[2], name)
+  for (let i = 1; i < node.length; i++) if (!onlyCalledNotReferenced(node[i], name)) return false
+  return true
+}
+
+const bodyStmtList = body =>
+  Array.isArray(body) && body[0] === '{}' ? blockStmts(body)
+  : Array.isArray(body) && body[0] === ';' ? body.slice(1)
+  : body == null ? [] : [body]
+
+const removeStmts = (body, set) => {
+  if (!Array.isArray(body)) return set.has(body) ? null : body
+  if (body[0] === '{}') return ['{}', removeStmts(body[1], set) ?? [';']]
+  if (body[0] === ';') {
+    const kept = body.slice(1).filter(s => !set.has(s))
+    return kept.length === 0 ? null : kept.length === 1 ? kept[0] : [';', ...kept]
+  }
+  return set.has(body) ? null : body
+}
+
+// Lambda body must be a guaranteed-return shape inlinedBody can splice: ≤1
+// `return` (trailing, if a block), no throw/break/continue, no param mutation,
+// no nested lambda.
+const inlinableLambdaBody = (abody, params) => {
+  if (scanBody(abody, n => n[0] === '=>')) return false
+  if (scanBody(abody, n => n[0] === 'throw' || n[0] === 'break' || n[0] === 'continue')) return false
+  let returns = 0
+  scanBody(abody, n => { if (n[0] === 'return') returns++; return false })
+  if (returns > 1) return false
+  if (returns === 1) {
+    const stmts = blockStmts(abody)
+    if (!stmts || !stmts.length) return false
+    const last = stmts[stmts.length - 1]
+    if (!Array.isArray(last) || last[0] !== 'return') return false
+  }
+  return !mutatesAny(abody, new Set(params))
+}
+
+const inlineLocalLambdasInBody = (getBody, setBody) => {
+  const body = getBody()
+  const stmts = bodyStmtList(body)
+  if (stmts.length < 2) return false
+
+  // Collect `const f = ARROW` (single-decl), all-plain params, inlinable body.
+  const decls = new Map()
+  for (const stmt of stmts) {
+    if (!Array.isArray(stmt) || stmt[0] !== 'const' || stmt.length !== 2) continue
+    const d = stmt[1]
+    if (!Array.isArray(d) || d[0] !== '=' || typeof d[1] !== 'string') continue
+    const arrow = d[2]
+    if (!Array.isArray(arrow) || arrow[0] !== '=>') continue
+    const params = extractParams(arrow[1])
+    if (!params.every(p => typeof p === 'string')) continue
+    if (!inlinableLambdaBody(arrow[2], params)) continue
+    decls.set(d[1], { stmt, arrow, params })
+  }
+  if (!decls.size) return false
+
+  // Drop any candidate whose body references another (or its own) candidate —
+  // single-level inlining can't resolve such chains, and a still-referenced
+  // candidate's decl can't be removed.
+  for (let changed = true; changed;) {
+    changed = false
+    for (const [name, info] of decls) {
+      if ([...decls.keys()].some(c => referencesName(info.arrow[2], c))) { decls.delete(name); changed = true }
+    }
+  }
+  // Every other reference to the name must be a `name(...)` call.
+  for (const [name, info] of [...decls]) {
+    if (!stmts.every(s => s === info.stmt || onlyCalledNotReferenced(s, name))) decls.delete(name)
+  }
+  if (!decls.size) return false
+
+  const asFunc = info => ({ sig: { params: info.params.map(name => ({ name })) }, body: info.arrow[2] })
+  const stmtCands = new Map(), exprCands = new Map()
+  for (const [name, info] of decls)
+    (Array.isArray(info.arrow[2]) && info.arrow[2][0] === '{}' ? stmtCands : exprCands).set(name, asFunc(info))
+
+  let out = body, didChange = false
+  if (stmtCands.size) { const r = inlineInStmt(out, stmtCands); if (r.changed) { out = r.node; didChange = true } }
+  if (exprCands.size) { const r = inlineInExpr(out, exprCands); if (r.changed) { out = r.node; didChange = true } }
+  if (!didChange) return false
+
+  // Remove decls of candidates that are now fully consumed.
+  const newStmts = bodyStmtList(out)
+  const dead = new Set()
+  for (const [name, info] of decls) {
+    if (!newStmts.some(s => s !== info.stmt && referencesName(s, name))) dead.add(info.stmt)
+  }
+  if (dead.size) out = removeStmts(out, dead) ?? [';']
+
+  setBody(out)
+  return true
+}
+
+const inlineLocalLambdas = () => {
+  let changed = false
+  for (const func of ctx.func.list) {
+    if (!func.body || func.raw) continue
+    if (inlineLocalLambdasInBody(() => func.body, b => { func.body = b })) changed = true
+  }
+  return changed
+}
+
 const restIndexExpr = (idx, restParams) => {
   const k = intLit(idx)
   if (k != null) return k >= 0 && k < restParams.length ? restParams[k] : [, undefined]
@@ -1227,11 +1401,23 @@ const materializeAutoBoxSchemas = (programFacts) => {
 
 const resolveClosureWidth = (programFacts) => {
   if (!ctx.closure.make) return
-  const { hasSpread, hasRest, maxCall, maxDef } = programFacts
+  const { hasSpread, hasRest, maxCall, maxDef, valueUsed } = programFacts
   const floor = ctx.closure.floor ?? 0
+  // A top-level function used as a first-class value gets a boundary trampoline
+  // that forwards $__a0..$__a{arity-1} into it (emit.js). The uniform closure
+  // ABI must therefore be at least as wide as any table-resident function's
+  // fixed arity — maxDef only counts surviving `=>` literals, so lifted/hoisted
+  // function definitions slip past it (their bodies are walked, their param
+  // lists aren't). Without this, e.g. an arity-3 function used only via a
+  // 1-arg indirect call emits `(local.get $__a2)` against a 2-param trampoline.
+  let maxValueArity = 0
+  if (valueUsed) for (const name of valueUsed) {
+    const n = ctx.func.map.get(name)?.sig?.params?.length ?? 0
+    if (n > maxValueArity) maxValueArity = n
+  }
   ctx.closure.width = (hasSpread && hasRest)
     ? MAX_CLOSURE_ARITY
-    : Math.min(MAX_CLOSURE_ARITY, Math.max(maxCall, maxDef + (hasRest ? 1 : 0), floor))
+    : Math.min(MAX_CLOSURE_ARITY, Math.max(maxCall, maxDef + (hasRest ? 1 : 0), maxValueArity, floor))
 }
 
 const canSkipWholeProgramNarrowing = (programFacts) =>
@@ -1247,7 +1433,12 @@ export default function plan(ast) {
   unboxConstTypedGlobals()
 
   let programFacts = collectProgramFacts(ast)
+  // The call-inlining family (`inlineHotInternalCalls` self-gates on `sourceInline`)
+  // is a pure speed optimization — the un-inlined calls emit correctly. Scalar
+  // replacement (`scalarize*`) is *not* gated on `sourceInline`: callers turn it on
+  // independently via `optimize: { sourceInline: false }` to test heap elision alone.
   if (inlineHotInternalCalls(programFacts, ast)) programFacts = collectProgramFacts(ast)
+  if (inlineLocalLambdas()) programFacts = collectProgramFacts(ast)
   if (specializeFixedRestCalls(programFacts)) programFacts = collectProgramFacts(ast)
   if (scalarizeFunctionArrayLiterals()) programFacts = collectProgramFacts(ast)
   if (scalarizeFunctionObjectLiterals()) programFacts = collectProgramFacts(ast)

@@ -225,7 +225,8 @@ export default (ctx) => {
       '__ptr_offset',
       ...(needsArrayDynMove() ? ['__dyn_move', '__hash_new', '__ihash_set_local'] : []),
     ],
-    __arr_set_idx_ptr: ['__arr_grow', '__ptr_offset', '__set_len'],
+    __arr_set_idx_ptr: ['__arr_grow', '__ptr_offset'],
+    __arr_push1: ['__arr_grow_known', '__ptr_offset'],
     __typed_idx: () => ctx.features.typedarray || ctx.features.external
       ? ['__len']
       : ['__len', '__ptr_offset'],
@@ -245,6 +246,16 @@ export default (ctx) => {
     return typed(['i32.and',
       ['f64.ne', ['local.tee', `$${t}`, v], ['local.get', `$${t}`]],
       ['i32.eq', ['call', '$__ptr_type', ['i64.reinterpret_f64', ['local.get', `$${t}`]]], ['i32.const', PTR.ARRAY]]], 'i32')
+  }
+
+  ctx.core.emit['new.Array'] = (len) => {
+    const n = tempI32('alen')
+    const nIR = ['local.get', `$${n}`]
+    const out = allocPtr({ type: PTR.ARRAY, len: nIR, cap: nIR, tag: 'newarr' })
+    return typed(['block', ['result', 'f64'],
+      ['local.set', `$${n}`, len == null ? ['i32.const', 0] : asI32(emit(len))],
+      out.init,
+      out.ptr], 'f64')
   }
 
   // ARRAY-only indexed read. Inline forwarding-follow + bounds check + load — avoids
@@ -313,8 +324,21 @@ export default (ctx) => {
     return `(func $__typed_idx (param $ptr i64) (param $i i32) (result f64)
     (local $t i32) (local $off i32) (local $et i32) (local $len i32) (local $aux i32)
     (local.set $t (i32.wrap_i64 (i64.and (i64.shr_u (local.get $ptr) (i64.const ${LAYOUT.TAG_SHIFT})) (i64.const ${LAYOUT.TAG_MASK}))))
-    (local.set $aux (i32.wrap_i64 (i64.and (i64.shr_u (local.get $ptr) (i64.const ${LAYOUT.AUX_SHIFT})) (i64.const ${LAYOUT.AUX_MASK}))))
     (local.set $off (i32.wrap_i64 (i64.and (local.get $ptr) (i64.const ${LAYOUT.OFFSET_MASK}))))
+    ;; ARRAY fast path: follow forwarding inline, bounds-check against header len, f64.load — no $__len call.
+    (if (i32.and (i32.eq (local.get $t) (i32.const ${PTR.ARRAY})) (i32.ge_u (local.get $off) (i32.const 8)))
+      (then
+        (block $done
+          (loop $follow
+            (br_if $done (i32.gt_u (local.get $off) (i32.shl (memory.size) (i32.const 16))))
+            (br_if $done (i32.ne (i32.load (i32.sub (local.get $off) (i32.const 4))) (i32.const -1)))
+            (local.set $off (i32.load (i32.sub (local.get $off) (i32.const 8))))
+            (br $follow)))
+        (return (if (result f64)
+          (i32.and (i32.ge_s (local.get $i) (i32.const 0)) (i32.lt_u (local.get $i) (i32.load (i32.sub (local.get $off) (i32.const 8)))))
+          (then (f64.load (i32.add (local.get $off) (i32.shl (local.get $i) (i32.const 3)))))
+          (else (f64.const nan:${UNDEF_NAN}))))))
+    (local.set $aux (i32.wrap_i64 (i64.and (i64.shr_u (local.get $ptr) (i64.const ${LAYOUT.AUX_SHIFT})) (i64.const ${LAYOUT.AUX_MASK}))))
     (if
       (i32.and
         (i32.eq (local.get $t) (i32.const ${PTR.TYPED}))
@@ -461,11 +485,27 @@ export default (ctx) => {
                   (i32.load (i32.sub (local.get $base) (i32.const 8))))
       (then
         (local.set $p (call $__arr_grow (local.get $ptr) (i32.add (local.get $i) (i32.const 1))))
-        (call $__set_len (i64.reinterpret_f64 (local.get $p)) (i32.add (local.get $i) (i32.const 1)))
-        (local.set $base (call $__ptr_offset (i64.reinterpret_f64 (local.get $p))))))
+        (local.set $base (call $__ptr_offset (i64.reinterpret_f64 (local.get $p))))
+        (i32.store (i32.sub (local.get $base) (i32.const 8)) (i32.add (local.get $i) (i32.const 1)))))
     (f64.store
       (i32.add (local.get $base) (i32.shl (local.get $i) (i32.const 3)))
       (local.get $val))
+    (local.get $p))`
+
+  // Out-of-line .push(val) for known-ARRAY receivers — keeps each call site to a
+  // single call + var update instead of ~30 inlined instructions. Returns the
+  // (possibly relocated) array pointer; caller derives the new length if needed.
+  ctx.core.stdlib['__arr_push1'] = `(func $__arr_push1 (param $ptr i64) (param $val f64) (result f64)
+    (local $p f64) (local $base i32) (local $len i32)
+    (local.set $p (f64.reinterpret_i64 (local.get $ptr)))
+    (local.set $base (call $__ptr_offset (local.get $ptr)))
+    (local.set $len (i32.load (i32.sub (local.get $base) (i32.const 8))))
+    (if (i32.lt_s (i32.load (i32.sub (local.get $base) (i32.const 4))) (i32.add (local.get $len) (i32.const 1)))
+      (then
+        (local.set $p (call $__arr_grow_known (local.get $ptr) (i32.add (local.get $len) (i32.const 1))))
+        (local.set $base (call $__ptr_offset (i64.reinterpret_f64 (local.get $p))))))
+    (f64.store (i32.add (local.get $base) (i32.shl (local.get $len) (i32.const 3))) (local.get $val))
+    (i32.store (i32.sub (local.get $base) (i32.const 8)) (i32.add (local.get $len) (i32.const 1)))
     (local.get $p))`
 
   // === Array literal ===
@@ -725,6 +765,21 @@ export default (ctx) => {
 
   // .push(val) → append, increment len, return array (possibly reallocated pointer)
   ctx.core.emit['.push'] = (arr, ...vals) => {
+    // Out-of-line fast path: single value, named known-ARRAY receiver. One call +
+    // var update instead of ~30 inlined instructions — the dominant size cost of
+    // push-heavy code (e.g. watr's WASM emitter).
+    if (vals.length === 1 && typeof arr === 'string' && lookupValType(arr) === VAL.ARRAY) {
+      inc('__arr_push1')
+      const box = ctx.func.boxed?.get(arr)
+      const isGlobal = !box && ctx.scope.globals.has(arr) && !ctx.func.locals?.has(arr)
+      const readVar = box ? ['f64.load', ['local.get', `$${box}`]] : isGlobal ? ['global.get', `$${arr}`] : ['local.get', `$${arr}`]
+      const writeVar = v => box ? ['f64.store', ['local.get', `$${box}`], v] : isGlobal ? ['global.set', `$${arr}`, v] : ['local.set', `$${arr}`, v]
+      const vv = asF64(emit(vals[0]))
+      return typed(['block', ['result', 'f64'],
+        writeVar(['call', '$__arr_push1', ['i64.reinterpret_f64', readVar], vv]),
+        ['f64.convert_i32_s', ['i32.load', ['i32.sub',
+          ['call', '$__ptr_offset', ['i64.reinterpret_f64', readVar]], ['i32.const', 8]]]]], 'f64')
+    }
     const va = asF64(emit(arr))
     const t = temp('pp'), len = tempI32('pl')
 
@@ -779,8 +834,10 @@ export default (ctx) => {
       )
     }
 
-    // Update length header, update source variable (pointer may have changed from grow), return new length
-    body.push(['call', '$__set_len', ['i64.reinterpret_f64', ['local.get', `$${t}`]], ['local.get', `$${len}`]])
+    // Update length header (write directly via the offset we already hold —
+    // skips __set_len's tag/forward dispatch), update source variable (pointer
+    // may have changed from grow), return new length
+    body.push(['i32.store', ['i32.sub', ['local.get', `$${pushBase}`], ['i32.const', 8]], ['local.get', `$${len}`]])
     // Update the source variable if it's a named variable (so arr still points to valid memory)
     if (typeof arr === 'string') {
       if (ctx.func.boxed?.has(arr)) {
@@ -898,8 +955,8 @@ export default (ctx) => {
         ['i32.shl',
           ['i32.sub', ['i32.sub', ['local.get', `$${len}`], ['local.get', `$${s}`]], ['local.get', `$${cnt}`]],
           ['i32.const', 3]]],
-      // update length
-      ['call', '$__set_len', ['i64.reinterpret_f64', va], ['i32.sub', ['local.get', `$${len}`], ['local.get', `$${cnt}`]]],
+      // update length (write directly via the offset we already hold)
+      ['i32.store', ['i32.sub', ['local.get', `$${off}`], ['i32.const', 8]], ['i32.sub', ['local.get', `$${len}`], ['local.get', `$${cnt}`]]],
       out.ptr,
     ]
     return typed(['block', ['result', 'f64'], ...body], 'f64')
@@ -919,7 +976,7 @@ export default (ctx) => {
       (local.get $off)
       (i32.shl (local.get $len) (i32.const 3)))
     (f64.store (local.get $off) (local.get $val))
-    (call $__set_len (i64.reinterpret_f64 (local.get $a)) (i32.add (local.get $len) (i32.const 1)))
+    (i32.store (i32.sub (local.get $off) (i32.const 8)) (i32.add (local.get $len) (i32.const 1)))
     (f64.convert_i32_s (i32.add (local.get $len) (i32.const 1))))`
 
   // .some(fn) → return 1 if any element passes, else 0 (early exit)

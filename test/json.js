@@ -80,6 +80,17 @@ test('JSON.parse: object value with escape', () => {
   is(run(`export let f = () => JSON.parse('{"k":"a\\\\"b"}').k.length`).f(), 3)
 })
 
+test('JSON.parse: \\uXXXX escapes decode to UTF-8', () => {
+  // ASCII code point → 1 byte.
+  is(run(`export let f = () => JSON.parse('["a\\\\u0041b"]')[0]`).f(), 'aAb')
+  // 2-byte code point (é = U+00E9) → 2 UTF-8 bytes; .length is byte length.
+  is(run(`export let f = () => JSON.parse('["x\\\\u00e9y"]')[0]`).f(), 'xéy')
+  // Surrogate pair (U+1F600) combines into one 4-byte code point.
+  is(run(`export let f = () => JSON.parse('["\\\\uD83D\\\\uDE00!"]')[0]`).f(), '😀!')
+  // \u escape on an object key.
+  is(run(`export let f = () => JSON.parse('{"a\\\\u0041":7}').aA`).f(), 7)
+})
+
 test('JSON.parse: nested array', () => {
   is(run(`export let f = () => JSON.parse("[[1,2],[3]]")[0][1]`).f(), 2)
 })
@@ -98,7 +109,7 @@ test('JSON.parse: static object dot access uses fixed-slot OBJECT load', () => {
   // const o = JSON.parse(SRC) folds to a fixed-shape OBJECT (schema-tagged,
   // slot-based). o.x reads `f64.load offset=0` from the object payload — no
   // hash dispatch, no runtime parser.
-  const wat = compile(`const SRC = '{"x":42}'; export let f = () => { const o = JSON.parse(SRC); return o.x }`, { wat: true })
+  const wat = compile(`const SRC = '{"x":42}'; export let f = () => { const o = JSON.parse(SRC); return o.x }`, { wat: true, optimize: { watr: true } })
   ok(!wat.includes('$__jp'))
   ok(!wat.includes('$__hash_get'))
   ok(!wat.includes('$__hash_get_local'))
@@ -129,7 +140,7 @@ test('JSON.parse: nested chains stay on OBJECT fast path', () => {
       return o.meta.bias + it.id
     }
   `
-  const wat = compile(src, { wat: true })
+  const wat = compile(src, { wat: true, optimize: { watr: true } })
   ok(!wat.includes('$__jp'))
   ok(!wat.includes('$__hash_get'))
   ok(!wat.includes('$__hash_get_local'))
