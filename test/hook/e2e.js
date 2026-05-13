@@ -274,3 +274,26 @@ test('hook/e2e: hook-xfl accept() receives float_sum return value as code', asyn
   ok(capturedCode != null, 'accept() should have been called')
   equal(capturedCode, SENTINEL + SENTINEL, `expected code=${SENTINEL + SENTINEL}, got ${capturedCode}`)
 })
+
+// ---------------------------------------------------------------------------
+// state_set: string val arg — len must equal string byte length, not buf offset
+// ---------------------------------------------------------------------------
+test('hook/e2e: state_set(string, string) passes correct val len to state_set', async () => {
+  let capturedValLen = null
+  const instance = await hookInstance(
+    `import { state_set } from 'hook'; export let hook = () => { state_set('DEADBEEF', '00123456'); return "ok" }`,
+    {
+      state_set: (vPtr, vLen, kPtr, kLen) => {
+        capturedValLen = vLen
+        return 0n
+      },
+    }
+  )
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  ok(capturedValLen != null, 'state_set() should have been called')
+  equal(capturedValLen, 8, `expected val len=8 for "DEADBEEF", got ${capturedValLen}`)
+})

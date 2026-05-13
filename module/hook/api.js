@@ -3,7 +3,7 @@
  * Registers all Xahau Hook API WASM imports and emitter table entries.
  */
 import { asI64, asI32, typed, temp } from '../../src/ir.js'
-import { inc, ctx } from '../../src/ctx.js'
+import { inc, ctx, LAYOUT, PTR } from '../../src/ctx.js'
 import { emit } from '../../src/emit.js'
 
 export const HOOK_SCRATCH_OFFSET = 512
@@ -211,6 +211,39 @@ export default (ctx) => {
     ]
   }
 
+  // hookValArgs(v) → [ptr_ir, len_ir]
+  // Like hookBufArgs but reads len from ptr-4 for strings (PTR.STRING) and ptr-8 for buffers.
+  const hookValArgs = (v) => {
+    const ir = asI64(emit(v))
+    const bits = getI64Bits(ir)
+    if (bits != null) {
+      const tag = Number((bits >> BigInt(LAYOUT.TAG_SHIFT)) & BigInt(LAYOUT.TAG_MASK))
+      const rawOffset = Number(bits & 0xFFFFFFFFn)
+      const lenOff = tag === PTR.STRING ? -4 : -8
+      const len = readDataI32(rawOffset + lenOff)
+      if (len != null) {
+        const ptr = rawOffset - (ctx.runtime.staticDataLen || 0)
+        return [typed(['i32.const', ptr], 'i32'), typed(['i32.const', len], 'i32')]
+      }
+    }
+    if (ir[0] === 'local.get' || ir[0] === 'global.get') {
+      const varName = typeof ir[1] === 'string' ? ir[1].replace(/^\$/, '') : null
+      const rep = varName
+        ? (ir[0] === 'local.get' ? ctx.func.repByLocal?.get(varName) : ctx.scope.repByGlobal?.get(varName))
+        : null
+      const lenOff = rep?.val === 'string' ? 4 : 8
+      return [
+        typed(['i32.wrap_i64', ir], 'i32'),
+        typed(['i32.load', ['i32.sub', ['i32.wrap_i64', ir], ['i32.const', lenOff]]], 'i32')
+      ]
+    }
+    const tmp = temp(); ctx.func.locals.set(tmp, 'i64')
+    return [
+      typed(['i32.wrap_i64', typed(['local.tee', `$${tmp}`, ir], 'i64')], 'i32'),
+      typed(['i32.load', ['i32.sub', ['i32.wrap_i64', typed(['local.get', `$${tmp}`], 'i64')], ['i32.const', 8]]], 'i32')
+    ]
+  }
+
   // === Emitters for zero-arg functions (return i64) ===
   for (const fn0 of ['otxn_type', 'otxn_burden', 'etxn_burden', 'etxn_generation', 'hook_pos', 'hook_again',
                      'ledger_last_time', 'ledger_seq', 'float_one']) {
@@ -336,7 +369,7 @@ export default (ctx) => {
 
   // state_set(val_buf, key)
   ctx.core.emit['hook.state_set'] = (val, key) =>
-    typed(['call', '$hook_state_set', ...hookBufArgs(val), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_state_set', ...hookValArgs(val), ...hookStrArgs(key)], 'i64')
 
   // otxn_field(sfField) → scratch; otxn_field(buf, sfField) → user buffer
   ctx.core.emit['hook.otxn_field'] = (arg0, arg1) => {
@@ -496,7 +529,7 @@ export default (ctx) => {
   // state_foreign_set(val, key, ns, acc)
   ctx.core.emit['hook.state_foreign_set'] = (val, key, ns, acc) =>
     typed(['call', '$hook_state_foreign_set',
-      ...hookBufArgs(val), ...hookStrArgs(key),
+      ...hookValArgs(val), ...hookStrArgs(key),
       ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
 
   // === Scratch buffer emitters (Change 4) ===
