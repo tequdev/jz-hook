@@ -3,15 +3,19 @@
  *
  * Uses Node.js WebAssembly.instantiate with mock env imports to actually
  * execute compiled hooks and verify observable side-effects:
- *   - accept hook: returns a NaN-boxed string value directly
+ *   - accept hook: mock intercepts accept() call and captures args
  *   - throw/rollback hook: mock env intercepts rollback() call
- *   - arithmetic loop hook: executes with _g guard mocks and returns numeric result
+ *   - arithmetic loop hook: executes with _g guard mocks; accept() captures numeric code
  *   - XFL hook: mock float_one/float_sum calls are dispatched correctly
  *
  * Mock env design:
  *   - _g(id: i32, max: i32) → i32  — always returns 1 (allow guard)
- *   - All other Hook API imports return 0n (i64/BigInt)
  *   - accept/rollback: throw a JS object so tests can intercept the call
+ *   - All other Hook API imports return 0n (i64/BigInt)
+ *
+ * NOTE: hook/cbak functions now always terminate via hook_accept + unreachable (or
+ * hook_rollback + unreachable). The mock accept/rollback must throw to prevent the
+ * WASM unreachable trap from firing.
  */
 import test from 'tst'
 import { ok, same } from 'tst/assert.js'
@@ -28,6 +32,14 @@ import { compile } from '../../index.js'
 function mockImports(overrides = {}) {
   const base = {
     _g: (id, max) => 1,   // (i32, i32) → i32
+    // Default accept: throw so WASM unreachable is never reached.
+    // Tests that need to intercept accept() args override this.
+    accept: (ptr, len, code) => {
+      throw Object.assign(new Error('accept'), { type: 'accept', ptr, len, code })
+    },
+    rollback: (ptr, len, code) => {
+      throw Object.assign(new Error('rollback'), { type: 'rollback', ptr, len, code })
+    },
   }
   const merged = { ...base, ...overrides }
   return {
@@ -54,53 +66,92 @@ async function hookInstance(src, envOverrides = {}) {
   return instance
 }
 
+/**
+ * Run a hook and capture the accept() call args. Returns { ptr, len, code } from accept.
+ * Throws if accept was not called.
+ */
+async function runHookCapturingAccept(src, envOverrides = {}) {
+  let captured = null
+  const overrides = {
+    ...envOverrides,
+    accept: (ptr, len, code) => {
+      captured = { ptr, len, code }
+      throw Object.assign(new Error('accept'), { type: 'accept', ptr, len, code })
+    },
+  }
+  const instance = await hookInstance(src, overrides)
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  if (captured == null) throw new Error('accept() was not called')
+  return { captured, instance }
+}
+
 // ---------------------------------------------------------------------------
-// hook-accept: simple hook returning a string — no env imports needed
+// hook-accept: simple hook returning a string — accept() is called with ptr/len
 // ---------------------------------------------------------------------------
-test('hook/e2e: hook-accept compiles and runs without env imports', async () => {
-  const instance = await hookInstance(`export let hook = () => "OK"`)
-  const result = instance.exports.hook(0)
-  // Result is an i64 NaN-boxed string value
-  ok(typeof result === 'bigint', `expected BigInt result, got ${typeof result}`)
+test('hook/e2e: hook-accept compiles and accept() is called', async () => {
+  let acceptCalled = false
+  const instance = await hookInstance(`export let hook = () => "OK"`, {
+    accept: (ptr, len, code) => {
+      acceptCalled = true
+      throw Object.assign(new Error('accept'), { type: 'accept' })
+    },
+  })
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  ok(acceptCalled, 'accept() should have been called')
 })
 
-test('hook/e2e: hook-accept returns NaN-boxed string tag=4 (STRING)', async () => {
-  const instance = await hookInstance(`export let hook = () => "OK"`)
-  const result = instance.exports.hook(0)
-  // NaN-box layout: bits 50-47 = type tag, 4 = STRING
-  const tag = Number((result >> 47n) & 0xFn)
-  equal(tag, 4, `expected STRING tag (4), got ${tag}`)
+test('hook/e2e: hook-accept accept() receives non-zero string length for "OK"', async () => {
+  const { captured } = await runHookCapturingAccept(`export let hook = () => "OK"`)
+  ok(captured.len > 0, `expected len > 0 for string "OK", got ${captured.len}`)
+  equal(captured.len, 2, `expected len=2 for "OK", got ${captured.len}`)
 })
 
-test('hook/e2e: hook-accept "OK" returns heap string (SSO disabled in hook mode)', async () => {
-  const instance = await hookInstance(`export let hook = () => "OK"`)
-  const result = instance.exports.hook(0)
-  // In hook mode SSO is disabled; "OK" is a heap string
-  // NaN-box layout: aux bits[46:32] should have SSO bit (0x4000) clear
-  const aux = Number((result >> 32n) & 0x7FFFn)
-  const isSSO = !!(aux & 0x4000)
-  ok(!isSSO, `expected heap string (no SSO), aux=${aux.toString(16)}`)
-  // ptr = low 32 bits; data layout: mem[ptr-4..ptr-1] = LE u32 length, mem[ptr..] = UTF-8 bytes
-  const ptr = Number(result & 0xFFFFFFFFn)
-  const mem = new Uint8Array(instance.exports.memory.buffer)
-  const len = mem[ptr-4] | (mem[ptr-3]<<8) | (mem[ptr-2]<<16) | (mem[ptr-1]<<24)
+test('hook/e2e: hook-accept "OK" memory has correct bytes at ptr', async () => {
+  let capturedPtr = null
+  let capturedMem = null
+  const overrides = {
+    accept: (ptr, len, code) => {
+      capturedPtr = ptr
+      throw Object.assign(new Error('accept'), { type: 'accept' })
+    },
+  }
+  const instance = await hookInstance(`export let hook = () => "OK"`, overrides)
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  capturedMem = new Uint8Array(instance.exports.memory.buffer)
+  ok(capturedPtr != null, 'accept should have been called')
+  // data layout: mem[ptr-4..ptr-1] = LE u32 length, mem[ptr..] = UTF-8 bytes
+  const ptr = capturedPtr
+  const len = capturedMem[ptr-4] | (capturedMem[ptr-3]<<8) | (capturedMem[ptr-2]<<16) | (capturedMem[ptr-1]<<24)
   equal(len, 2, `expected length 2 at mem[ptr-4], got ${len}`)
-  equal(mem[ptr], 79, `expected 'O' (79) at mem[ptr], got ${mem[ptr]}`)
-  equal(mem[ptr+1], 75, `expected 'K' (75) at mem[ptr+1], got ${mem[ptr+1]}`)
+  equal(capturedMem[ptr], 79, `expected 'O' (79) at mem[ptr], got ${capturedMem[ptr]}`)
+  equal(capturedMem[ptr+1], 75, `expected 'K' (75) at mem[ptr+1], got ${capturedMem[ptr+1]}`)
 })
 
 // ---------------------------------------------------------------------------
-// hook-loop: arithmetic loop with _g guard — no string operations
+// hook-loop: arithmetic loop with _g guard — accept() receives the numeric code
 // ---------------------------------------------------------------------------
-test('hook/e2e: hook-loop executes and returns correct sum', async () => {
+test('hook/e2e: hook-loop accept() receives correct sum as code', async () => {
   // The compiler constant-folds 0+1+2+3+4 = 10; guard not inserted for const iter
-  const instance = await hookInstance(
+  const { captured } = await runHookCapturingAccept(
     `export let hook = () => { let s = 0; for (let i = 0; i < 5; i++) s = s + i; return s }`
   )
-  const result = instance.exports.hook(0)
-  // Result is i64.reinterpret_f64(f64.convert_i32_s(10)) = f64(10.0) reinterpreted as i64
-  const expected = new DataView(new Float64Array([10]).buffer).getBigUint64(0, true)
-  equal(result, expected, `expected f64(10) as i64 = ${expected}, got ${result}`)
+  // accept(ptr=0, len=0, code=10i64) — numeric return lowers to accept(0, 0, value)
+  equal(captured.ptr, 0, `expected ptr=0 for numeric accept, got ${captured.ptr}`)
+  equal(captured.len, 0, `expected len=0 for numeric accept, got ${captured.len}`)
+  // code is i64 BigInt; the value 10 is passed as an i64
+  ok(captured.code === 10n || Number(captured.code) === 10, `expected code=10, got ${captured.code}`)
 })
 
 test('hook/e2e: hook-loop with dynamic bound calls _g guard', async () => {
@@ -114,7 +165,11 @@ test('hook/e2e: hook-loop with dynamic bound calls _g guard', async () => {
     `,
     { _g: (id, max) => { guardCallCount++; return 1 } }
   )
-  instance.exports.hook(0)
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
   ok(guardCallCount > 0, `expected _g to be called at least once, got ${guardCallCount} calls`)
 })
 
@@ -167,6 +222,7 @@ test('hook/e2e: hook-throw rollback() receives non-zero string length for "err"'
 test('hook/e2e: hook-xfl calls float_one() and float_sum() via mock env', async () => {
   let floatOneCalls = 0
   let floatSumCalls = 0
+  let acceptCalled = false
   const instance = await hookInstance(
     `
       import { float_one, float_sum } from 'hook'
@@ -175,18 +231,26 @@ test('hook/e2e: hook-xfl calls float_one() and float_sum() via mock env', async 
     {
       float_one: () => { floatOneCalls++; return 1n },
       float_sum: (a, b) => { floatSumCalls++; return a + b },
+      accept: (ptr, len, code) => {
+        acceptCalled = true
+        throw Object.assign(new Error('accept'), { type: 'accept', code })
+      },
     }
   )
-  const result = instance.exports.hook(0)
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
   equal(floatOneCalls, 1, `expected 1 float_one call, got ${floatOneCalls}`)
   equal(floatSumCalls, 1, `expected 1 float_sum call, got ${floatSumCalls}`)
-  // float_one returns 1n, float_sum(1n, 1n) = 2n → reinterpreted as f64 then i64 by wrapper
-  ok(typeof result === 'bigint', `expected BigInt return from hook, got ${typeof result}`)
+  ok(acceptCalled, `expected accept() to be called`)
 })
 
-test('hook/e2e: hook-xfl result matches float_sum return value', async () => {
+test('hook/e2e: hook-xfl accept() receives float_sum return value as code', async () => {
   // Use identity-like mocks: float_one returns a sentinel, float_sum adds args
   const SENTINEL = 42n
+  let capturedCode = null
   const instance = await hookInstance(
     `
       import { float_one, float_sum } from 'hook'
@@ -195,10 +259,18 @@ test('hook/e2e: hook-xfl result matches float_sum return value', async () => {
     {
       float_one: () => SENTINEL,
       float_sum: (a, b) => a + b,
+      accept: (ptr, len, code) => {
+        capturedCode = code
+        throw Object.assign(new Error('accept'), { type: 'accept' })
+      },
     }
   )
-  const result = instance.exports.hook(0)
-  // float_sum(42n, 42n) = 84n; the hook wrapper does i64.reinterpret_f64(f64.reinterpret_i64(84n))
-  // which is a round-trip for non-NaN values: 84n → f64(84n bits) → i64(same bits) = 84n
-  equal(result, SENTINEL + SENTINEL, `expected ${SENTINEL + SENTINEL}, got ${result}`)
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  // float_sum(42n, 42n) = 84n passed as code to accept(0, 0, 84n)
+  ok(capturedCode != null, 'accept() should have been called')
+  equal(capturedCode, SENTINEL + SENTINEL, `expected code=${SENTINEL + SENTINEL}, got ${capturedCode}`)
 })

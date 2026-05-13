@@ -33,7 +33,7 @@ import {
   analyzeBoxedCaptures, updateRep, inferStringParams,
 } from './analyze.js'
 import { optimizeFunc, treeshake } from './optimize.js'
-import { emit, emitter, emitFlat, emitBody } from './emit.js'
+import { emit, emitter, emitFlat, emitBody, emitHookAccept } from './emit.js'
 import {
   typed, asF64, asI32, asPtrOffset, asParamType, toI32, asI64, fromI64,
   NULL_NAN, UNDEF_NAN, NULL_WAT, UNDEF_WAT, NULL_IR, UNDEF_IR, nullExpr, undefExpr,
@@ -148,6 +148,7 @@ function enterFunc(func) {
   ctx.func.stack = []
   ctx.func.uniq = 0
   ctx.func.current = func.sig
+  ctx.func.currentName = func.name
   ctx.func.body = func.body
   ctx.func.directClosures = null
   ctx.func.localProps = null
@@ -334,22 +335,40 @@ function emitFunc(func, funcFacts, programFacts) {
       ['f64.store', ['local.get', `$${cell}`], nullExpr()])
   }
 
+  const isHookEntry = ctx.transform.host === 'hook' && (name === 'hook' || name === 'cbak')
   if (block) {
     const stmts = emitBody(body)
     for (const [l, t] of ctx.func.locals) fn.push(['local', `$${l}`, t])
-    // I: Skip trailing fallback when last statement is return (unreachable code)
-    const lastStmt = stmts.at(-1)
-    const endsWithReturn = lastStmt && (lastStmt[0] === 'return' || lastStmt[0] === 'return_call')
-    fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, ...stmts, ...(endsWithReturn ? [] : sig.results.map(t => [`${t}.const`, 0])))
+    if (isHookEntry) {
+      // Fallthrough accept(0, 0, 0) + unreachable after body. Dead code when body ends with
+      // explicit return/throw (already lowered to accept/rollback + unreachable), but provides
+      // accept for hook functions that fall through without an explicit return.
+      fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, ...stmts,
+        ['drop', ['call', '$hook_accept', ['i32.const', 0], ['i32.const', 0], ['i64.const', 0]]],
+        ['unreachable'],
+        ['i64.const', 0])
+    } else {
+      // I: Skip trailing fallback when last statement is return (unreachable code)
+      const lastStmt = stmts.at(-1)
+      const endsWithReturn = lastStmt && (lastStmt[0] === 'return' || lastStmt[0] === 'return_call')
+      fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, ...stmts, ...(endsWithReturn ? [] : sig.results.map(t => [`${t}.const`, 0])))
+    }
   } else if (multi && body[0] === '[') {
     const values = body.slice(1).map(e => asF64(emit(e)))
     for (const [l, t] of ctx.func.locals) fn.push(['local', `$${l}`, t])
     fn.push(...boxedParamInits, ...preboxedLocalInits, ...values)
   } else {
-    const ir = emit(body)
-    for (const [l, t] of ctx.func.locals) fn.push(['local', `$${l}`, t])
-    const finalIR = sig.ptrKind != null ? asPtrOffset(ir, sig.ptrKind) : asParamType(ir, sig.results[0])
-    fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, tcoTailRewrite(finalIR, sig.results[0]))
+    if (isHookEntry) {
+      // Expression body: accept(body_value) + unreachable + dead i64.const 0 (for WASM type checker)
+      const acceptBlock = emitHookAccept(body)
+      for (const [l, t] of ctx.func.locals) fn.push(['local', `$${l}`, t])
+      fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, acceptBlock, ['i64.const', 0])
+    } else {
+      const ir = emit(body)
+      for (const [l, t] of ctx.func.locals) fn.push(['local', `$${l}`, t])
+      const finalIR = sig.ptrKind != null ? asPtrOffset(ir, sig.ptrKind) : asParamType(ir, sig.results[0])
+      fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, tcoTailRewrite(finalIR, sig.results[0]))
+    }
   }
 
   // Restore schema.vars so param bindings don't leak to next function.
@@ -478,6 +497,7 @@ function emitClosureBody(cb) {
   const paramDecls = [{ name: '__env', type: 'f64' }, { name: '__argc', type: 'i32' }]
   for (let i = 0; i < W; i++) paramDecls.push({ name: `__a${i}`, type: 'f64' })
   ctx.func.current = { params: paramDecls, results: ['f64'] }
+  ctx.func.currentName = cb.name
 
   const fn = ['func', `$${cb.name}`]
   fn.push(['param', '$__env', 'f64'])

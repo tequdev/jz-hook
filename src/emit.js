@@ -850,6 +850,41 @@ function inferGuardMaxIter(cond) {
 }
 
 /**
+ * Emit a hook_accept call in hook mode.
+ * - expr == null → accept(0, 0, 0i64) + unreachable
+ * - valTypeOf(expr) === VAL.STRING → string-ptr pattern (low 32 bits = ptr, ptr-4 = len)
+ * - otherwise → accept(0, 0, value_as_i64) + unreachable
+ * @param {Array|null} expr AST expression or null
+ * @returns typed 'void' IR node
+ */
+export function emitHookAccept(expr) {
+  if (expr == null) {
+    return typed(['block',
+      ['drop', ['call', '$hook_accept', ['i32.const', 0], ['i32.const', 0], ['i64.const', 0]]],
+      ['unreachable']], 'void')
+  }
+  const vt = valTypeOf(expr)
+  if (vt === VAL.STRING) {
+    const tmp = tempI64('msg')
+    ctx.func.locals.set(tmp, 'i64')
+    return typed(['block',
+      ['local.set', `$${tmp}`, asI64(emit(expr))],
+      ['drop', ['call', '$hook_accept',
+        typed(['i32.wrap_i64', typed(['local.get', `$${tmp}`], 'i64')], 'i32'),
+        typed(['i32.load', ['i32.sub', ['i32.wrap_i64', typed(['local.get', `$${tmp}`], 'i64')], ['i32.const', 4]]], 'i32'),
+        ['i64.const', 0]]],
+      ['unreachable']], 'void')
+  }
+  // Numeric / unknown: treat value as error code, empty message
+  const tmp = tempI64('code')
+  ctx.func.locals.set(tmp, 'i64')
+  return typed(['block',
+    ['local.set', `$${tmp}`, asI64(emit(expr))],
+    ['drop', ['call', '$hook_accept', ['i32.const', 0], ['i32.const', 0], ['local.get', `$${tmp}`]]],
+    ['unreachable']], 'void')
+}
+
+/**
  * Core emitter table. Maps AST ops to WASM IR generators.
  * ctx.core.emit is seeded with a flat copy of this object on reset;
  * modules add or override ops on ctx.core.emit directly.
@@ -981,6 +1016,13 @@ export const emitter = {
   },
 
   'return': expr => {
+    // Hook mode: lower return in hook/cbak → accept(msg, 0) + unreachable
+    if (ctx.transform.host === 'hook' &&
+        (ctx.func.currentName === 'hook' || ctx.func.currentName === 'cbak')) {
+      const finalizers = emitFinalizers()
+      const acceptBlock = emitHookAccept(expr)
+      return finalizers.length > 0 ? [...finalizers, acceptBlock] : acceptBlock
+    }
     const finalizers = emitFinalizers()
     const finalizerBlock = () => [['block', ...finalizers]]
     if (ctx.func.current?.results.length > 1 && Array.isArray(expr) && expr[0] === '[') {
