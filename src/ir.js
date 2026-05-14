@@ -124,6 +124,14 @@ export const asI64 = n => {
   // In non-hook mode i32 means a raw integer that must be converted to the NaN-boxed
   // f64 bit representation, so fall through to the f64 roundtrip path.
   if (n.type === 'i32' && ctx.transform.host === 'hook') return typed(['i64.extend_i32_s', n], 'i64')
+  // Peephole: i64.reinterpret_f64(f64.convert_i32_u(x)) → i64.extend_i32_u(x)
+  //           i64.reinterpret_f64(f64.convert_i32_s(x)) → i64.extend_i32_s(x)
+  // Typed array element reads (e.g. Uint32Array[i]) go through f64.convert_i32_u.
+  // Reinterpreting those f64 bits as i64 gives the IEEE-754 encoding of the number,
+  // not the integer value itself. Extending the underlying i32 directly preserves
+  // the numeric value as expected by Hook API functions (trace_num, etc.).
+  if (Array.isArray(n) && n[0] === 'f64.convert_i32_u') return typed(['i64.extend_i32_u', n[1]], 'i64')
+  if (Array.isArray(n) && n[0] === 'f64.convert_i32_s') return typed(['i64.extend_i32_s', n[1]], 'i64')
   return typed(['i64.reinterpret_f64', asF64(n)], 'i64')
 }
 
