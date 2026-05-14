@@ -36,6 +36,7 @@ const TESTS = [
   'test262-regressions',
   'semantic-invariants',
   'differential',
+  'hook/e2e',
 ]
 
 const argFilters = process.argv.slice(2)

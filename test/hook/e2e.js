@@ -276,6 +276,49 @@ test('hook/e2e: hook-xfl accept() receives float_sum return value as code', asyn
 })
 
 // ---------------------------------------------------------------------------
+// trace: label/data args len must reflect string byte length when label/data is a string
+// ---------------------------------------------------------------------------
+test('hook/e2e: trace(label, string, ashex) passes correct label len', async () => {
+  let capturedLabelLen = null
+  const instance = await hookInstance(
+    `import { trace } from 'hook'; export let hook = () => { trace('ABCD', 'ABCD', false); return "ok" }`,
+    {
+      trace: (lPtr, lLen, dPtr, dLen, asHex) => {
+        capturedLabelLen = lLen
+        return 0n
+      },
+    }
+  )
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  ok(capturedLabelLen != null, 'trace() should have been called')
+  equal(capturedLabelLen, 4, `expected label len=4 for "ABCD", got ${capturedLabelLen}`)
+})
+
+test('hook/e2e: trace(label, string, ashex) passes correct data len', async () => {
+  let capturedDataLen = null
+  const instance = await hookInstance(
+    `import { trace } from 'hook'; export let hook = () => { trace('lbl', 'ABCD', false); return "ok" }`,
+    {
+      trace: (lPtr, lLen, dPtr, dLen, asHex) => {
+        capturedDataLen = dLen
+        return 0n
+      },
+    }
+  )
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  ok(capturedDataLen != null, 'trace() should have been called')
+  equal(capturedDataLen, 4, `expected data len=4 for "ABCD", got ${capturedDataLen}`)
+})
+
+// ---------------------------------------------------------------------------
 // state_set: string val arg — len must equal string byte length, not buf offset
 // ---------------------------------------------------------------------------
 test('hook/e2e: state_set(string, string) passes correct val len to state_set', async () => {

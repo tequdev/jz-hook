@@ -353,16 +353,16 @@ export default (ctx) => {
   // trace(label, data, ashex)
   ctx.core.emit['hook.trace'] = (label, data, ashex) =>
     typed(['call', '$hook_trace',
-      ...hookStrArgs(label), ...hookBufArgs(data),
+      ...hookValArgs(label), ...hookValArgs(data),
       eopt32(ashex, ['i32.const', 0])], 'i64')
 
   // trace_num(label, num)
   ctx.core.emit['hook.trace_num'] = (label, num) =>
-    typed(['call', '$hook_trace_num', ...hookStrArgs(label), e64(num)], 'i64')
+    typed(['call', '$hook_trace_num', ...hookValArgs(label), e64(num)], 'i64')
 
   // trace_float(label, xfl)
   ctx.core.emit['hook.trace_float'] = (label, xfl) =>
-    typed(['call', '$hook_trace_float', ...hookStrArgs(label), e64(xfl)], 'i64')
+    typed(['call', '$hook_trace_float', ...hookValArgs(label), e64(xfl)], 'i64')
 
   // state(out_buf, key) → state(wptr, wlen, kptr, klen)
   ctx.core.emit['hook.state'] = (out, key) =>
