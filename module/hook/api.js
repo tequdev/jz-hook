@@ -404,7 +404,9 @@ export default (ctx) => {
 
   // hookNullableCapArgs: undefined → (ptr=0, len=0); otherwise hookCapArgs
   // Passing (0,0) to Hook API output functions queries field size without writing.
-  const isUndefinedNode = (v) => v?.type === 'Identifier' && v?.name === 'undefined'
+  // jessie parses `undefined` as [] → prepare converts to [, undefined] (literal node, v[1] === undefined).
+  // 'undefined' string → prepare → [, JZ_NULL Symbol]. Both patterns must be caught.
+  const isUndefinedNode = (v) => Array.isArray(v) && v[0] == null && (v[1] === undefined || typeof v[1] === 'symbol')
   const hookNullableCapArgs = (v) => isUndefinedNode(v)
     ? [typed(['i32.const', 0], 'i32'), typed(['i32.const', 0], 'i32')]
     : hookCapArgs(v)
