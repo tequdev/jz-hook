@@ -21,10 +21,10 @@ export let hook = () => sfAccount
   ok(!wat.includes('call $sfAccount'), `sfAccount should be inlined, not called, got:\n${wat}`)
 })
 
-test('hook/keylets: sfAccount value is 0x8001 = 32769', () => {
+test('hook/keylets: sfAccount value is 0x80001 = 524289', () => {
   const wat = compile(`
 import { sfAccount } from 'hook'
 export let hook = () => sfAccount
 `, { host: 'hook', wat: true, jzify: true })
-  ok(wat.includes('32769'), `expected 32769 (0x8001) in WAT, got:\n${wat}`)
+  ok(wat.includes('524289'), `expected 524289 (0x80001) in WAT, got:\n${wat}`)
 })

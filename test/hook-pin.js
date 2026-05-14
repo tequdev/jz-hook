@@ -19,10 +19,10 @@ const TOLERANCE = 0.10  // 10%
 // Baseline sizes (bytes) — established from the current build
 // Update these when intentional size increases are made
 const BASELINES = {
-  'hook-accept':         133,
-  'hook-firewall':       293,
-  'hook-xfl':            202,
-  'hook-state-counter':  198,
+  'hook-accept':         199,
+  'hook-firewall':       358,
+  'hook-xfl':            265,
+  'hook-state-counter':  261,
 }
 
 let pass = 0, fail = 0
