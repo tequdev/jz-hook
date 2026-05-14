@@ -102,11 +102,11 @@ import {
 
 | JS | Hook |
 |----|------|
-| `console.log("msg", val)` | `trace("msg", 0, val, 0, 0)` |
-| `console.log(n)` (number) | `trace_num("", 0, n)` |
+| `console.log("msg", val)` | `trace("msg", 0, val, len(val), 0)` |
+| `console.log(n)` (number) | `trace_num("", n)` |
 | `throw "error"` | `rollback("error", 0)` |
 | `return "OK"` at hook() | `accept("OK", 0)` |
-| `Date.now()` | `ledger_last_time()` |
+| `Date.now()` | `ledger_last_time()` + 946684800 |
 | `Math.random()` | **compile-time error** (non-deterministic) |
 
 ### Supported subset

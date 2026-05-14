@@ -268,6 +268,7 @@ const setupJsHost = (ctx) => {
 }
 
 export default (ctx) => {
+  if (ctx.transform.host === 'hook') return  // Hook module (trace.js) handles these
   if (ctx.transform.host === 'wasi') setupWasi(ctx)
   else setupJsHost(ctx)
 }

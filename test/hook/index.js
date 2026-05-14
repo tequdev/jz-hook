@@ -20,6 +20,7 @@ const TESTS = [
   'reinterpret-opt',
   'validate-wasm',
   'e2e',
+  'idiom-map',
 ]
 
 const argFilters = process.argv.slice(2)

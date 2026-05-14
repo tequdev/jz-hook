@@ -149,8 +149,10 @@ export default (ctx) => {
   ctx.core.emit['math.clz32'] = a => typed(['i32.clz', toI32(emit(a))], 'i32')
   ctx.core.emit['math.imul'] = (a, b) => typed(['i32.mul', toI32(emit(a)), toI32(emit(b))], 'i32')
 
-  // Random
-  ctx.core.emit['math.random'] = () => (inc('math.random'), typed(['call', '$math.random'], 'f64'))
+  // Random — forbidden in hook mode (non-deterministic)
+  if (ctx.transform?.host !== 'hook') {
+    ctx.core.emit['math.random'] = () => (inc('math.random'), typed(['call', '$math.random'], 'f64'))
+  }
 
   // ============================================
   // WAT stdlib implementations
