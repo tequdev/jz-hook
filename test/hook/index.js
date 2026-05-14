@@ -16,6 +16,7 @@ const TESTS = [
   'keylets-helpers',
   'missing-api',
   'samples',
+  'samples-wat',
   'reinterpret-opt',
   'validate-wasm',
   'e2e',
