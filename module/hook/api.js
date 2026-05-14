@@ -70,6 +70,7 @@ export default (ctx) => {
   ensureHookImport(ctx, 'otxn_burden', [])
   ensureHookImport(ctx, 'otxn_slot', ['i32'])
   ensureHookImport(ctx, 'otxn_id', ['i32', 'i32', 'i32'])
+  ensureHookImport(ctx, 'otxn_param', ['i32', 'i32', 'i32', 'i32'])
 
   // === Slot operations ===
   ensureHookImport(ctx, 'slot', ['i32', 'i32', 'i32'])
@@ -262,13 +263,13 @@ export default (ctx) => {
   ctx.core.emit['hook.etxn_reserve'] = (count) =>
     typed(['call', '$hook_etxn_reserve', e32(count)], 'i64')
 
-  // etxn_nonce() → scratch; etxn_nonce(write_ptr, write_len) → user buffer
-  ctx.core.emit['hook.etxn_nonce'] = (wPtr, wLen) => {
-    if (wPtr == null) {
+  // etxn_nonce() → scratch; etxn_nonce(out_buf) → user buffer
+  ctx.core.emit['hook.etxn_nonce'] = (out) => {
+    if (out == null) {
       return typed(['call', '$hook_etxn_nonce',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_etxn_nonce', e32(wPtr), e32(wLen)], 'i64')
+    return typed(['call', '$hook_etxn_nonce', ...hookBufArgs(out)], 'i64')
   }
 
   // etxn_fee_base(tx_buf) → i64
@@ -279,9 +280,9 @@ export default (ctx) => {
   ctx.core.emit['hook.otxn_slot'] = (slot) =>
     typed(['call', '$hook_otxn_slot', e32(slot)], 'i64')
 
-  // otxn_id(write_ptr: i32, write_len: i32, flags: i32) → i64
-  ctx.core.emit['hook.otxn_id'] = (wPtr, wLen, flags) =>
-    typed(['call', '$hook_otxn_id', e32(wPtr), e32(wLen),
+  // otxn_id(out_buf, flags?) → i64
+  ctx.core.emit['hook.otxn_id'] = (out, flags) =>
+    typed(['call', '$hook_otxn_id', ...hookBufArgs(out),
       eopt32(flags, ['i32.const', 0])], 'i64')
 
   // slot_clear, slot_count, slot_size, slot_float, meta_slot (slot: i32) → i64
@@ -382,42 +383,47 @@ export default (ctx) => {
   }
 
   // hook_account() → scratch; hook_account(out_buf) → user buffer
-  ctx.core.emit['hook.hook_account'] = (wPtr, wLen) => {
-    if (wPtr == null) {
+  ctx.core.emit['hook.hook_account'] = (out) => {
+    if (out == null) {
       return typed(['call', '$hook_hook_account',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_hook_account', e32(wPtr), e32(wLen)], 'i64')
+    return typed(['call', '$hook_hook_account', ...hookBufArgs(out)], 'i64')
   }
 
   // hook_skip(nh: i32, name: i32) → i64
   ctx.core.emit['hook.hook_skip'] = (nh, name) =>
     typed(['call', '$hook_hook_skip', e32(nh), e32(name)], 'i64')
 
-  // hook_param(write_ptr, write_len, read_ptr, read_len) → i64
-  ctx.core.emit['hook.hook_param'] = (wPtr, wLen, rPtr, rLen) =>
-    typed(['call', '$hook_hook_param', e32(wPtr), e32(wLen), e32(rPtr), e32(rLen)], 'i64')
+  // hook_param(out_buf, key) → i64
+  ctx.core.emit['hook.hook_param'] = (out, key) =>
+    typed(['call', '$hook_hook_param', ...hookBufArgs(out), ...hookStrArgs(key)], 'i64')
 
-  // hook_param_set(write_ptr, write_len, read_ptr, read_len, kread_ptr, kread_len) → i64
-  ctx.core.emit['hook.hook_param_set'] = (...args) =>
-    typed(['call', '$hook_hook_param_set', ...args.slice(0, 6).map(v => e32(v))], 'i64')
+  // hook_param_set(val, key, hook_hash) → i64
+  ctx.core.emit['hook.hook_param_set'] = (val, key, hookHash) =>
+    typed(['call', '$hook_hook_param_set',
+      ...hookValArgs(val), ...hookStrArgs(key), ...hookBufArgs(hookHash)], 'i64')
+
+  // otxn_param(out_buf, key) → i64
+  ctx.core.emit['hook.otxn_param'] = (out, key) =>
+    typed(['call', '$hook_otxn_param', ...hookBufArgs(out), ...hookStrArgs(key)], 'i64')
 
   // ledger_last_hash() → scratch; ledger_last_hash(out_buf) → user buffer
-  ctx.core.emit['hook.ledger_last_hash'] = (wPtr, wLen) => {
-    if (wPtr == null) {
+  ctx.core.emit['hook.ledger_last_hash'] = (out) => {
+    if (out == null) {
       return typed(['call', '$hook_ledger_last_hash',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_ledger_last_hash', e32(wPtr), e32(wLen)], 'i64')
+    return typed(['call', '$hook_ledger_last_hash', ...hookBufArgs(out)], 'i64')
   }
 
   // ledger_nonce() → scratch; ledger_nonce(out_buf) → user buffer
-  ctx.core.emit['hook.ledger_nonce'] = (wPtr, wLen) => {
-    if (wPtr == null) {
+  ctx.core.emit['hook.ledger_nonce'] = (out) => {
+    if (out == null) {
       return typed(['call', '$hook_ledger_nonce',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_ledger_nonce', e32(wPtr), e32(wLen)], 'i64')
+    return typed(['call', '$hook_ledger_nonce', ...hookBufArgs(out)], 'i64')
   }
 
   // ledger_keylet(write_ptr, write_len, keylet_type, read_ptr, read_len, read2_ptr, read2_len) → i64
