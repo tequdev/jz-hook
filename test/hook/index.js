@@ -12,6 +12,7 @@ const TESTS = [
   'validate-missing-hook',
   'keylets',
   'xfl',
+  'float-compare',
   'keylets-helpers',
   'missing-api',
   'samples',

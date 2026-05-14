@@ -331,8 +331,28 @@ export default (ctx) => {
       typed(['call', `$hook_${fn2}`, e64(a), e64(b)], 'i64')
   }
 
-  ctx.core.emit['hook.float_compare'] = (a, b, mode) =>
-    typed(['call', '$hook_float_compare', e64(a), e64(b), eopt32(mode, ['i32.const', 0])], 'i64')
+  ctx.core.emit['hook.float_compare'] = (a, b, modeNode) => {
+    // modeNode is an AST string literal node: ['str', 'EQ'] or [null, 'EQ']
+    const modeStr = Array.isArray(modeNode) && typeof modeNode[1] === 'string' ? modeNode[1] : null
+    let mode;
+    //  { EQUAL = 1, LESS = 2, GREATER = 4 };
+    if (modeStr === 'EQ') {
+      mode = 1;
+    } else if (modeStr === 'NE') {
+      mode = 2 + 4;
+    } else if (modeStr === 'LT') {
+      mode = 2;
+    } else if (modeStr === 'GT') {
+      mode = 4;
+    } else if (modeStr === 'LE') {
+      mode = 1 + 2;
+    } else if (modeStr === 'GE') {
+      mode = 1 + 4;
+    } else {
+      throw new Error(`float_compare: mode must be one of: EQ, NE, LT, GT, LE, GE`);
+    }
+    return typed(['call', '$hook_float_compare', e64(a), e64(b), typed(['i32.const', mode], 'i32')], 'i64')
+  }
 
   for (const fn1 of ['float_negate', 'float_invert', 'float_mantissa', 'float_sign', 'float_exponent']) {
     ctx.core.emit[`hook.${fn1}`] = (a) => typed(['call', `$hook_${fn1}`, e64(a)], 'i64')
@@ -386,9 +406,9 @@ export default (ctx) => {
       ...hookValArgs(label), ...hookValArgs(data),
       eopt32(ashex, ['i32.const', 0])], 'i64')
   // trace(label, data, 1)
-  ctx.core.emit('hook.trace_hex') = (label, data) => ctx.core.emit['hook.trace'](label, data, 1)
+  ctx.core.emit['hook.trace_hex'] = (label, data) => ctx.core.emit['hook.trace'](label, data, 1)
   // trace(label, data, 0)
-  ctx.core.emit('hook.trace_utf8') = (label, data) => ctx.core.emit['hook.trace'](label, data, 0)
+  ctx.core.emit['hook.trace_utf8'] = (label, data) => ctx.core.emit['hook.trace'](label, data, 0)
 
   // trace_num(label, num)
   ctx.core.emit['hook.trace_num'] = (label, num) =>

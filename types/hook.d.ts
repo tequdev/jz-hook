@@ -154,7 +154,7 @@ declare module 'hook' {
   export function float_sum(a: I64, b: I64): I64
   export function float_negate(a: I64): I64
   export function float_invert(a: I64): I64
-  export function float_compare(a: I64, b: I64, mode?: I32): I64
+  export function float_compare(a: I64, b: I64, mode: 'EQ' | 'NE' | 'LT' | 'GT' | 'LE' | 'GE'): I64
   export function float_mantissa(a: I64): I64
   export function float_sign(a: I64): I64
   export function float_exponent(a: I64): I64
