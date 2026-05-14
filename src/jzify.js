@@ -31,7 +31,7 @@ export default function jzify(ast) {
   const names = new Set()
   ast = hoistVars(ast, names)
   if (names.size) ast = prependDecls(ast, names)
-  return foldStaticExportHelpers(transformScope(ast))
+  return foldStaticExportHelpers(canonicalizeObjectIdioms(transformScope(ast)))
 }
 
 /**
@@ -80,7 +80,10 @@ function hoistVars(node, names) {
   if (op === 'for') {
     const head = node[1]
     let h2
-    if (Array.isArray(head) && head[0] === 'var' && Array.isArray(head[1]) &&
+    const normalizedHead = normalizeForDeclHead(head, names)
+    if (normalizedHead) {
+      h2 = normalizedHead
+    } else if (Array.isArray(head) && head[0] === 'var' && Array.isArray(head[1]) &&
         (head[1][0] === 'in' || head[1][0] === 'of') && typeof head[1][1] === 'string') {
       names.add(head[1][1])
       h2 = [head[1][0], head[1][1], hoistVars(head[1][2], names)]
@@ -135,6 +138,27 @@ function prependDecls(body, names) {
     return ['{}', [';', decl, inner]]
   }
   return body == null ? decl : [';', decl, body]
+}
+
+function normalizeForDeclHead(head, names) {
+  if (!Array.isArray(head) || (head[0] !== 'var' && head[0] !== 'let' && head[0] !== 'const') || head.length !== 2) return null
+  const kind = head[0]
+  const expr = head[1]
+  if (!Array.isArray(expr)) return null
+  if (expr.length >= 3 && Array.isArray(expr[1]) &&
+      (expr[1][0] === 'in' || expr[1][0] === 'of') && typeof expr[1][1] === 'string') {
+    const iter = expr[1]
+    return [iter[0], normalizeForDecl(kind, iter[1], names), hoistVars([expr[0], iter[2], ...expr.slice(2)], names)]
+  }
+  return null
+}
+
+function normalizeForDecl(kind, name, names) {
+  if (kind === 'var') {
+    names.add(name)
+    return name
+  }
+  return [kind, name]
 }
 
 /** Convert a named function declaration to a hoisted const arrow */
@@ -507,12 +531,16 @@ const handlers = {
     const clean = cases.map(c => {
       if (c[0] === 'case' && Array.isArray(c[2]) && c[2][0] === ';') {
         const body = c[2].slice(1).filter(s => typeof s !== 'number')
-        return ['case', c[1], body.length === 1 ? body[0] : [';', ...body]]
+        const stripped = stripTerminalSwitchBreak(body.length === 1 ? body[0] : [';', ...body])
+        return ['case', c[1], stripped]
       }
       if (c[0] === 'default' && Array.isArray(c[1]) && c[1][0] === ';') {
         const body = c[1].slice(1).filter(s => s != null && typeof s !== 'number')
-        return ['default', body.length === 1 ? body[0] : [';', ...body]]
+        const stripped = stripTerminalSwitchBreak(body.length === 1 ? body[0] : [';', ...body])
+        return ['default', stripped]
       }
+      if (c[0] === 'case') return ['case', c[1], stripTerminalSwitchBreak(c[2])]
+      if (c[0] === 'default') return ['default', stripTerminalSwitchBreak(c[1])]
       return c
     })
     return transformSwitch(disc, clean)
@@ -537,7 +565,7 @@ const handlers = {
       return ['()', ['.', transform(['new', ctor[1][1]]), ctor[1][2]], ...ctor.slice(2).map(transform)]
     }
     const name = typeof ctor === 'string' ? ctor : (Array.isArray(ctor) && ctor[0] === '()' ? ctor[1] : null)
-    if (typeof name === 'string' && (TYPED_ARRAYS.has(name) || name === 'Array')) return ['new', transform(ctor), ...cargs.map(transform)]
+    if (typeof name === 'string' && (TYPED_ARRAYS.has(name) || name === 'Array' || name === 'RegExp')) return ['new', transform(ctor), ...cargs.map(transform)]
     if (Array.isArray(ctor) && ctor[0] === '()') return transform(ctor)
     // `new C(a)` → `C(a)`; `new C` (no parens) → `C()` — a 2-element `['()', X]`
     // is grouping parens, so a no-arg call needs the explicit `null` arg slot.
@@ -723,10 +751,108 @@ function replaceStaticExportReads(node, rewrites) {
   return node.map((part, i) => i === 0 ? part : replaceStaticExportReads(part, rewrites))
 }
 
+function canonicalizeObjectIdioms(node) {
+  if (node == null || typeof node !== 'object' || !Array.isArray(node)) return node
+
+  const out = node.map((part, i) => i === 0 ? part : canonicalizeObjectIdioms(part))
+
+  const hasOwnCall = objectHasOwnPropertyCall(out)
+  if (hasOwnCall) return ['()', ['.', hasOwnCall.obj, 'hasOwnProperty'], hasOwnCall.key]
+
+  const mapString = arrayMapStringCallback(out)
+  if (mapString) return mapString
+
+  if (out[0] === '&&') {
+    const leftCtor = constructorIsObject(out[1])
+    const rightKeys = objectKeysLengthZero(out[2])
+    if (leftCtor && rightKeys && astEqual(leftCtor.obj, rightKeys.obj)) return out[2]
+
+    const leftKeys = objectKeysLengthZero(out[1])
+    const rightCtor = constructorIsObject(out[2])
+    if (leftKeys && rightCtor && astEqual(leftKeys.obj, rightCtor.obj)) return out[1]
+  }
+
+  return out
+}
+
+function arrayMapStringCallback(node) {
+  if (!Array.isArray(node) || node[0] !== '()') return null
+  const callee = node[1]
+  if (!Array.isArray(callee) || callee[0] !== '.' || callee[2] !== 'map') return null
+  const args = callArgs(node.slice(2))
+  if (args.length !== 1 || args[0] !== 'String') return null
+  return ['()', callee, ['=>', 'value', ['()', 'String', 'value']]]
+}
+
+function objectHasOwnPropertyCall(node) {
+  if (!Array.isArray(node) || node[0] !== '()') return null
+  const callee = node[1]
+  if (!Array.isArray(callee) || callee[0] !== '.' || callee[2] !== 'call') return null
+  if (!Array.isArray(callee[1]) || callee[1][0] !== '.' || callee[1][1] !== 'Object' || callee[1][2] !== 'hasOwnProperty') return null
+  const args = callArgs(node.slice(2))
+  if (args.length < 2) return null
+  return { obj: args[0], key: args[1] }
+}
+
+function constructorIsObject(node) {
+  if (!Array.isArray(node) || (node[0] !== '===' && node[0] !== '==')) return null
+  const left = constructorReceiver(node[1])
+  if (left && node[2] === 'Object') return { obj: left }
+  const right = constructorReceiver(node[2])
+  if (right && node[1] === 'Object') return { obj: right }
+  return null
+}
+
+function constructorReceiver(node) {
+  return Array.isArray(node) && node[0] === '.' && node[2] === 'constructor' ? node[1] : null
+}
+
+function objectKeysLengthZero(node) {
+  if (!Array.isArray(node) || (node[0] !== '===' && node[0] !== '==')) return null
+  const left = objectKeysLengthReceiver(node[1])
+  if (left && isZeroLiteral(node[2])) return { obj: left }
+  const right = objectKeysLengthReceiver(node[2])
+  if (right && isZeroLiteral(node[1])) return { obj: right }
+  return null
+}
+
+function objectKeysLengthReceiver(node) {
+  if (!Array.isArray(node) || node[0] !== '.' || node[2] !== 'length') return null
+  const call = node[1]
+  if (!Array.isArray(call) || call[0] !== '()') return null
+  const callee = call[1]
+  if (!Array.isArray(callee) || callee[0] !== '.' || callee[1] !== 'Object' || callee[2] !== 'keys') return null
+  const args = callArgs(call.slice(2))
+  return args.length === 1 ? args[0] : null
+}
+
+function isZeroLiteral(node) {
+  return Array.isArray(node) && node[0] == null && node[1] === 0
+}
+
+function astEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
 function cloneAst(node) {
   if (node == null || typeof node !== 'object') return node
   if (!Array.isArray(node)) return node
   return node.map(cloneAst)
+}
+
+function stripTerminalSwitchBreak(body) {
+  if (!Array.isArray(body)) return body
+  if (body[0] === 'break') return null
+  if (body[0] === '{}') {
+    const inner = stripTerminalSwitchBreak(body[1])
+    if (inner == null) return ['{}', [';']]
+    return ['{}', Array.isArray(inner) && inner[0] === ';' ? inner : [';', inner]]
+  }
+  if (body[0] !== ';') return body
+
+  const stmts = body.slice(1)
+  if (Array.isArray(stmts.at(-1)) && stmts.at(-1)[0] === 'break') stmts.pop()
+  return stmts.length === 0 ? null : stmts.length === 1 ? stmts[0] : [';', ...stmts]
 }
 
 /** Transform switch statement to if/else chain. */

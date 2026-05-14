@@ -227,6 +227,11 @@ test('Error(): throw surfaces readable message', () => {
   is(error.message, 'test')
 })
 
+test('Error(): module-scope throw declares runtime error globals', () => {
+  const wasm = compile('if (1) throw Error("test"); export let f = () => 1')
+  ok(wasm instanceof Uint8Array)
+})
+
 test('try/catch: catches thrown value', () => {
   is(run('export let f = (x) => { try { if (x < 0) throw -1; return x * 2 } catch (e) { return e + 100 } }').f(-1), 99)
 })
@@ -700,6 +705,46 @@ test('=== alias for ==', () => {
 
 test('for...in: count keys', () => {
   is(run('export let f = () => { let o = {x: 1, y: 2, z: 3}; let c = 0; for (let k in o) c++; return c }').f(), 3)
+})
+
+test('for...in: continue in runtime HASH iteration advances', () => {
+  const code = `export let f = () => {
+    let o = {}
+    o.x = 1
+    o.y = 2
+    o.z = 3
+    let c = 0
+    for (let k in o) {
+      if (k == "y") continue
+      c++
+    }
+    return c
+  }`
+  const wat = compile(code, { wat: true, optimize: false })
+  ok(wat.includes('$cont'))
+  const wasm = compile(code)
+  const { f } = new WebAssembly.Instance(new WebAssembly.Module(wasm), { env: { __ext_set() {} } }).exports
+  is(f(), 2)
+})
+
+test('for...in: break in runtime HASH iteration exits', () => {
+  const code = `export let f = () => {
+    let o = {}
+    o.x = 1
+    o.y = 2
+    o.z = 3
+    let c = 0
+    for (let k in o) {
+      c++
+      break
+    }
+    return c
+  }`
+  const wat = compile(code, { wat: true, optimize: false })
+  ok(!wat.includes('$cont'))
+  const wasm = compile(code)
+  const { f } = new WebAssembly.Instance(new WebAssembly.Module(wasm), { env: { __ext_set() {} } }).exports
+  is(f(), 1)
 })
 
 test('if(0) still falsy', () => {

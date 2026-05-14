@@ -31,6 +31,7 @@ import {
   T, VAL, analyzeValTypes, analyzeIntCertain, analyzeLocals,
   analyzePtrUnboxable, typedElemAux, invalidateLocalsCache,
   analyzeBoxedCaptures, updateRep, inferStringParams,
+  isBlockBody,
 } from './analyze.js'
 import { optimizeFunc, treeshake } from './optimize.js'
 import { emit, emitter, emitFlat, emitBody, emitHookAccept } from './emit.js'
@@ -140,6 +141,17 @@ const tcoTailRewrite = (ir, resultType) => {
   return ir
 }
 
+const ensureThrowRuntime = (sec) => {
+  if (!ctx.runtime.throws) return
+
+  if (!ctx.scope.globals.has('__jz_last_err_bits'))
+    ctx.scope.globals.set('__jz_last_err_bits', '(global $__jz_last_err_bits (mut i64) (i64.const 0))')
+  if (!sec.tags.some(t => Array.isArray(t) && t[0] === 'tag' && t[1] === '$__jz_err'))
+    sec.tags.push(['tag', '$__jz_err', ['param', 'f64']])
+  if (!sec.tags.some(t => Array.isArray(t) && t[0] === 'export' && t[1] === '"__jz_last_err_bits"'))
+    sec.tags.push(['export', '"__jz_last_err_bits"', ['global', '$__jz_last_err_bits']])
+}
+
 // === Module compilation ===
 
 const cloneRepMap = map => map ? new Map([...map].map(([k, v]) => [k, { ...v }])) : null
@@ -161,7 +173,7 @@ function analyzeFuncForEmit(func, programFacts) {
   const { name, body, sig } = func
   enterFunc(func)
 
-  const block = Array.isArray(body) && body[0] === '{}' && body[1]?.[0] !== ':'
+  const block = isBlockBody(body)
   ctx.func.boxed = new Map()
   ctx.func.repByLocal = null
   ctx.types.typedElem = ctx.scope.globalTypedElem ? new Map(ctx.scope.globalTypedElem) : null
@@ -391,7 +403,7 @@ function emitFunc(func, funcFacts, programFacts) {
  *   - takes i64 params always — JS-side carrier is BigInt that reinterprets to
  *     f64 NaN-box bits. i64 dodges V8's spec-permitted NaN canonicalization at
  *     the wasm↔JS boundary (see ToJSValue / ToWebAssemblyValue). Host wrap()
- *     in src/host.js pairs by converting BigInt↔f64 via reinterpret bits.
+ *     in interop/nanbox.js pairs by converting BigInt↔f64 via reinterpret bits.
  *   - converts each narrowed param at the call: f64 → i32 (truncate-sat) for
  *     numeric narrowed, f64 → i32-offset (`i32.wrap_i64 + i64.reinterpret_f64`)
  *     for pointer narrowed. The reinterpret happens once at param decode and
@@ -405,7 +417,8 @@ function emitFunc(func, funcFacts, programFacts) {
  *
  * Result rebox cases (then reinterpret to i64 at the boundary):
  *   - sig.ptrKind != null  → mkPtrIR(ptrKind, ptrAux ?? 0, callIR)
- *   - sig.results[0] = i32 → f64.convert_i32_s(callIR)
+ *   - sig.results[0] = i32 → f64.convert_i32_s(callIR), or `_u` when
+ *                            sig.unsignedResult (preserves `(x >>> 0)` ∈ [0, 2³²))
  *   - sig.results[0] = f64 → callIR (some params narrowed but result stayed f64)
  */
 function synthesizeBoundaryWrappers() {
@@ -444,7 +457,7 @@ function synthesizeBoundaryWrappers() {
       const ptrType = valKindToPtr(sig.ptrKind)
       body = mkPtrIR(ptrType, sig.ptrAux ?? 0, callIR)
     } else if (sig.results[0] === 'i32') {
-      body = ['f64.convert_i32_s', callIR]
+      body = [sig.unsignedResult ? 'f64.convert_i32_u' : 'f64.convert_i32_s', callIR]
     } else {
       body = callIR
     }
@@ -522,7 +535,7 @@ function emitClosureBody(cb) {
   }
 
   // Emit body
-  const block = Array.isArray(cb.body) && cb.body[0] === '{}' && cb.body[1]?.[0] !== ':'
+  const block = isBlockBody(cb.body)
   let bodyIR
   if (block) {
     invalidateLocalsCache(cb.body)
@@ -649,7 +662,7 @@ function emitClosureBody(cb) {
       ['then', ['local.set', `$${restLen}`, ['i32.const', restSlots]]]])
     fn.push(['local.set', `$${restOff}`,
       ['call', '$__alloc_hdr',
-        ['local.get', `$${restLen}`], ['local.get', `$${restLen}`], ['i32.const', 8]]])
+        ['local.get', `$${restLen}`], ['local.get', `$${restLen}`]]])
     for (let i = 0; i < restSlots; i++) {
       fn.push(['if', ['i32.gt_s', ['local.get', `$${restLen}`], ['i32.const', i]],
         ['then', ['f64.store',
@@ -824,12 +837,6 @@ export default function compile(ast, profiler) {
 
   // Memory section deferred — emitted after resolveIncludes() when __alloc is needed
 
-  if (ctx.runtime.throws) {
-    ctx.scope.globals.set('__jz_last_err_bits', '(global $__jz_last_err_bits (mut i64) (i64.const 0))')
-    sec.tags.push(['tag', '$__jz_err', ['param', 'f64']])
-    sec.tags.push(['export', '"__jz_last_err_bits"', ['global', '$__jz_last_err_bits']])
-  }
-
   if (ctx.closure.table?.length)
     sec.table.push(['table', ['export', '"__jz_table"'], ctx.closure.table.length, 'funcref'])
 
@@ -878,6 +885,7 @@ export default function compile(ast, profiler) {
 
   optimizeModule(sec)
 
+  ensureThrowRuntime(sec)
   if (ctx.transform.host === 'hook') insertGuards(sec)
 
   // Populate globals (after __start — const folding may update declarations)

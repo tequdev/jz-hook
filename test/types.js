@@ -4,7 +4,7 @@ import test from 'tst'
 import { is, ok, throws, almost } from 'tst/assert.js'
 import { parse } from 'subscript/feature/jessie'
 import jz, { compile } from '../index.js'
-import { UNDEF_NAN, NULL_NAN } from '../src/host.js'
+import { UNDEF_NAN, NULL_NAN } from '../interop/nanbox.js'
 import prepare, { GLOBALS } from '../src/prepare.js'
 import { ctx, reset } from '../src/ctx.js'
 import { emitter } from '../src/emit.js'
@@ -312,6 +312,44 @@ test('switch: two cases', () => {
   is(f(1), 10)
   is(f(2), 20)
   is(f(99), -1)
+})
+
+test('switch: jzify strips terminal case breaks', () => {
+  const { f } = run(`export let f = (x) => {
+    let y = 0
+    switch (x) {
+      case 1:
+        y = 10
+        break
+      case 2:
+        y = 20
+        break
+      default:
+        y = 30
+        break
+    }
+    return y
+  }`, { jzify: true })
+  is(f(1), 10)
+  is(f(2), 20)
+  is(f(99), 30)
+})
+
+test('switch: jzify strips terminal breaks inside braced cases', () => {
+  const { f } = run(`export let f = (x) => {
+    let y = 0
+    switch (x) {
+      case 1: {
+        y = 10
+        break
+      }
+      default:
+        y = 30
+    }
+    return y
+  }`, { jzify: true })
+  is(f(1), 10)
+  is(f(2), 30)
 })
 
 // === Default params ===

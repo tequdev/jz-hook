@@ -7,21 +7,6 @@
 * [ ] Benchmarks
 * [ ] Clear, fully transparent codebase; complete docs / readme / tests / repl
 
-### Competitive size/speed gate — jz wasm ≤ AssemblyScript / Porffor
-
-Infra landed (`scripts/bench-size.mjs`, rewritten `test/bench-pin.js` with per-case `win`/`tie`/`todo` claims + geomean ceilings + `wasm-opt -Oz` slack assertion, `.github/workflows/bench.yml` runs it on every push/PR, `test/differential.js` fuzz wired into `npm test`, `bench/sort/` added, CONTRIBUTING "Performance & size invariant"). Ratchet rule: when a `todo` is beaten, promote it to `win`/`tie` in the same PR; tighten geomean ceilings and `WASMOPT_SLACK_MIN` as codegen improves.
-
-Gaps the gate currently surfaces (each is a `todo` in `test/bench-pin.js`):
-
-* [x] **`sort` (in-place heapsort): jz ~8.6× slower than V8/`asc -O3`** — FIXED. Root cause: cross-call typed-array param propagation didn't reach the 3-deep `main→runKernel→heapsort→siftDown` chain — `siftDown.a` stayed an untyped NaN-boxed f64 ⇒ `a[child]` → runtime `__typed_idx`/`__typed_set_idx` calls + `child` an f64 index with `i32.trunc_sat` per access. Two fixes in `narrow.js`: (1) `runArrElemFixpoint` now iterates a *soft* ctor merge to a fixpoint (don't sticky-poison a callee on the first sweep when the caller's own param isn't typed yet), then one hard validating sweep; (2) `refreshCallerLocals` seeds pointer-narrowed params' val-kind into a transient `repByLocal` so `n = arr.length` is recognised as i32 and propagates to `siftDown`'s `end` param. Result: `siftDown` now emits direct `f64.load/store` + i32 indices; jz beats `asc -O3` and runs at V8 parity. `bench-pin.js` sort: v8 `near`, as `tie`. Size still ~1.10× `asc -Oz` (generic codegen slack, item below).
-* [ ] **jz wasm vs `asc -Oz` on the kernels** — geomean **1.01×** after `dropDeadZeroInit` + dead-global-elimination landed (was 1.11×). `aos`/`bitwise`/`crc32`/`mandelbrot`/`poly`/`sort`/`callback` now win; only `biquad` 1.11×, `mat4` 1.18×, `tokenizer` 1.20× still trail. `SIZE_GEOMEAN_MAX.as` ratcheted 1.25→1.12→1.05; `WASMOPT_SLACK_MIN` 0.65→0.70. Next lever for the last 3: single-use runtime-helper inlining (wasm-opt collapses ~6 helper funcs per kernel — `__mkptr`, `__alloc_hdr`, `mix`, `__char_at`, `__str_byteLen`, `printResult`), and merging the `$f$exp` i32→f64 export wrapper into `$f`. Also: trim dead data-segment prefixes (`NaNInfinity-Infinity…[Object]` ftoa/itoa table survives in kernels that don't stringify numbers).
-* [ ] **`wasm-opt -Oz` removes ~20–30% of jz's own output** on small modules (`slack` column ~0.72–0.86× post dead-global; json/watr ~0.90×). Each byte wasm-opt strips is a jz codegen-size bug. Done so far: `dropDeadZeroInit` (redundant `local.set $x (zero)`), dead-global elimination in `treeshake`. Remaining: single-use helper inlining (the big one — 6 funcs/kernel), `$f$exp` wrapper merge. Target `WASMOPT_SLACK_MIN` 0.95+.
-* [x] **`valid jz = valid JS` break — `Math.round`** — FIXED (`module/math.js`): `f64.nearest` (ties-to-even) replaced with ties-toward-+∞ — emit `nearest(x)`, bump by one iff `nearest(x) === x - 0.5` (the only disagreeing case; −0.5→−0 and 0.49999…94→0 already match). Repro folded into `test/differential.js` (`rounding`, `round half-integers`); stale `Math.round(-3.5)` assertion in `test/math.js` corrected (was `-4`, JS gives `-3`).
-* [x] **`valid jz = valid JS` break — `Math.imul`/`Math.clz32` operand coercion** — FIXED (`module/math.js`): operands now go through `toI32` (ECMAScript ToInt32, wrapping, +∞/NaN→0) instead of `asI32` (saturating) — `Math.imul(x, 2654435761)` wraps to negative like JS instead of clamping to INT_MAX. Repro folded into `test/differential.js` (`imul big literal`).
-* [ ] Porffor speed: per-case porf claims are all `todo` — porf currently fails at runtime on most bench cases (memory OOB / `ReferenceError`); only the aggregate `geomean jz/porf ≤ 1.10×` gate is active. Revisit promoting individual cases to `win` when porf can run them (or when jz adds cases porf handles).
-* [ ] Widen the corpus toward real jz target workloads as the application takes shape — add the app's hot modules as bench cases (`.js` + `.as.ts`), wire into `SPEED`/`SIZE`/`SIZE_BUDGET`. The corpus *is* the guarantee.
-* [ ] Add sort line in readme bench table
-
 ### Floatbeat playground
 
 * [ ] Syntax highlighter
@@ -57,6 +42,7 @@ Gaps the gate currently surfaces (each is a `todo` in `test/bench-pin.js`):
 * [ ] jzify uses jessie, pure jz uses internal parser
 * [ ] True metacircular bootstrap
 * [ ] swappable watr: AST likely needs stringifying before compile if an adapter is provided
+
 * [ ] Running wasm files without pulling jz dependency for wrapping nan-boxes — alternative way to pass data?
 
 ### REPL
@@ -88,6 +74,17 @@ Gaps the gate currently surfaces (each is a `todo` in `test/bench-pin.js`):
 ---
 
 ## Archive
+
+### Jessie compilation blockers (see [.work/jessie-wasm.md](jessie-wasm.md))
+
+* [x] #1 spread in `?.()` — `fn?.(...args)`
+* [x] #2 Error subclasses (`SyntaxError`/`TypeError`/`RangeError`/`ReferenceError`/`URIError`/`EvalError`)
+* [x] #5 CLI bare side-effect imports `import './x.js'`
+* [x] #6 `new RegExp("lit")` literal pattern + clean error for dynamic
+* [x] #7 `Object.create` stdlib include — `array` module wasn't pulled in for `__arr_from`
+* [~] ~~#3 `Object.defineProperty(obj, k, {get, set})` — needs accessor-property design~~
+* [x] ~~#4 `delete obj[k]` on dynamic-keyed objects — touches static-shape model (eval-only; parse-only jessie no longer needs it)~~
+* [x] #8 computed object property keys `{[k]: v}` — lowered in prepare to `((t) => (t[k1]=v1, …, t))({static_only})`, side-effects preserved; numeric→string key coercion still gappy on read (separate follow-up)
 
 ### Product / Validation
 
@@ -163,6 +160,15 @@ Gaps the gate currently surfaces (each is a `todo` in `test/bench-pin.js`):
 * [x] Closed as low-value: partial unroll + f64x2 vector body for mat4 — inner loops are constant-trip 4×4×4; full unroll + f64x2 dot-pairing already runs mat4 at 0.78× native C
 * [x] Closed as low-value: json arena/raw-u8 fast path — bench already ≈1.0× native C; the residual micro-gap (transient `kbuf` in `__jp_obj` never rewound, per-node `__alloc`) needs a parser value-shape redesign for marginal gain
 * [x] Closed as low-value: source/runtime array-view optimization for `normalize()`-style local queue arrays — needs a source refactor or escape-analysis extension (also noted in "Size — closing the AS gap" archive)
+
+### Competitive size/speed gate
+
+* [x] **`sort` (in-place heapsort): jz ~8.6× slower than V8/`asc -O3`** — FIXED. Root cause: cross-call typed-array param propagation didn't reach the 3-deep `main→runKernel→heapsort→siftDown` chain — `siftDown.a` stayed an untyped NaN-boxed f64 ⇒ `a[child]` → runtime `__typed_idx`/`__typed_set_idx` calls + `child` an f64 index with `i32.trunc_sat` per access. Two fixes in `narrow.js`: (1) `runArrElemFixpoint` now iterates a *soft* ctor merge to a fixpoint (don't sticky-poison a callee on the first sweep when the caller's own param isn't typed yet), then one hard validating sweep; (2) `refreshCallerLocals` seeds pointer-narrowed params' val-kind into a transient `repByLocal` so `n = arr.length` is recognised as i32 and propagates to `siftDown`'s `end` param. Result: `siftDown` now emits direct `f64.load/store` + i32 indices; jz beats `asc -O3` and runs at V8 parity. `bench-pin.js` sort: v8 `near`, as `tie`. Size still ~1.10× `asc -Oz` (generic codegen slack, follow-up open).
+* [x] **`valid jz = valid JS` break — `Math.round`** — FIXED (`module/math.js`): `f64.nearest` (ties-to-even) replaced with ties-toward-+∞ — emit `nearest(x)`, bump by one iff `nearest(x) === x - 0.5` (the only disagreeing case; −0.5→−0 and 0.49999…94→0 already match). Repro folded into `test/differential.js` (`rounding`, `round half-integers`); stale `Math.round(-3.5)` assertion in `test/math.js` corrected (was `-4`, JS gives `-3`).
+* [x] **`valid jz = valid JS` break — `Math.imul`/`Math.clz32` operand coercion** — FIXED (`module/math.js`): operands now go through `toI32` (ECMAScript ToInt32, wrapping, +∞/NaN→0) instead of `asI32` (saturating) — `Math.imul(x, 2654435761)` wraps to negative like JS instead of clamping to INT_MAX. Repro folded into `test/differential.js` (`imul big literal`).
+* [x] **All `bench/bench.mjs` cases run at `optimize: { level: 'speed' }`** — previously biquad / mandelbrot / tokenizer fell back to `balanced` or `size` because `'speed'` produced wrong checksums or crashes. Two upstream optimizer bugs fixed in watr:
+  * `inlineOnce` zero-init leak — substituting an init-`local.set $x 0` callee body into a caller that already used `$x` for another value silently aliased the slot. Fixed by gating substitution on absence of caller writes to the target local.
+  * `propagate.substGets` sibling-eval leak (commit `d0e2d8a`) — `substGets` recursed through operand siblings sharing one `known` map; when arg1 contained `(local.tee $X NEW)`, arg2's `(local.get $X)` got substituted with $X's pre-tee tracked constant. After `coalesceLocals` aliased an init-const local with a sibling-read role this surfaced as `alloc(len=320, cap=40, …)` in biquad → buffer overflow → wrong checksum `1465809949` vs expected `422839881`. Fix: per-sibling invalidation in `substGets` (drop tracked entries whose slot was set/tee'd by an earlier sibling), with lazy `Map` clone so the overhead is paid only when needed. Regression test in `watr/test/optimize.js`. jz `bench/bench.mjs` synced to `'speed'` in commit `fb46c29`; tokenizer 0.583× (`win`). Mandelbrot ~0.90× local / ~1.005× CI — within noise of V8; claim demoted `win`→`tie` because the inner loop is at the wasm-v1 algorithmic floor (3 fmul + 4 fadd + 1 fsub + 1 fgt + 3 i32 ops + 3 branches, no instruction left to drop), wasm v1 has no scalar `f64.fma`, and `f64x2.relaxed_madd` lane-0 measured 17% *slower* on ARM due to splat/extract overhead. Revisit if the wasm `fma` proposal lands.
 
 ### i64-tagged carrier switch — investigated, closed wontfix
 

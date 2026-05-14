@@ -43,7 +43,7 @@ const SPEED = {
   mat4:           { v8: 'win',  as: 'win',  porf: 'todo' },
   poly:           { v8: 'win',  as: 'tie',  porf: 'todo' },
   biquad:         { v8: 'win',  as: 'win',  porf: 'todo' },
-  mandelbrot:     { v8: 'win',  as: 'tie',  porf: 'todo' },
+  mandelbrot:     { v8: 'tie',  as: 'tie',  porf: 'todo' },
   bitwise:        { v8: 'win',  as: 'win',  porf: 'todo' },
   tokenizer:      { v8: 'win',  as: 'diff', porf: 'todo' },
   aos:            { v8: 'win',  as: 'win',  porf: 'todo' },

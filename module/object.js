@@ -11,6 +11,7 @@ import { typed, asF64, asI64, temp, tempI32, allocPtr, needsDynShadow, mkPtrIR, 
 import { emit } from '../src/emit.js'
 import { valTypeOf, lookupValType, VAL, repOf, updateRep, shapeOf } from '../src/analyze.js'
 import { ctx, err, inc, PTR, LAYOUT } from '../src/ctx.js'
+import { includeModule } from '../src/autoload.js'
 
 
 export default (ctx) => {
@@ -32,7 +33,7 @@ export default (ctx) => {
       const merged = target ? ctx.schema.resolve(target) : null
       const schemaId = merged ? ctx.schema.idOf(target) : 0
       const cap = merged ? Math.max(1, merged.length) : 1
-      return mkPtrIR(PTR.OBJECT, schemaId, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', cap], ['i32.const', 8]])
+      return mkPtrIR(PTR.OBJECT, schemaId, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', cap]])
     }
 
     // Flatten comma-grouped props: [',', p1, p2] → [p1, p2]
@@ -82,7 +83,7 @@ export default (ctx) => {
     }
 
     const body = [
-      ['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)], ['i32.const', 8]]],
+      ['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)]]],
     ]
     for (let i = 0; i < values.length; i++)
       body.push(['f64.store', slotAddr(t, i), asF64(emit(values[i]))])
@@ -150,8 +151,9 @@ export default (ctx) => {
   }
 
   ctx.core.emit['Object.entries'] = (obj) => {
+    if (isHashTyped(obj)) return emitHashEntries(obj)
     const schema = resolveSchema(obj)
-    if (!schema) err('Object.entries requires object with known schema')
+    if (!schema) return emitRuntimeEntries(obj)
     const va = asF64(emit(obj))
     const n = schema.length
     const t = temp('oe'), pair = tempI32('op'), base = tempI32('eb')
@@ -160,7 +162,7 @@ export default (ctx) => {
       ['local.set', `$${base}`, ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]]]
     for (let i = 0; i < n; i++) {
       body.push(
-        ['local.set', `$${pair}`, ['call', '$__alloc_hdr', ['i32.const', 2], ['i32.const', 2], ['i32.const', 8]]],
+        ['local.set', `$${pair}`, ['call', '$__alloc_hdr', ['i32.const', 2], ['i32.const', 2]]],
         ['f64.store', slotAddr(pair, 0), emit(['str', schema[i]])],
         ['f64.store', slotAddr(pair, 1), ['f64.load', slotAddr(base, i)]],
         ['f64.store', slotAddr(out.local, i), mkPtrIR(PTR.ARRAY, 0, ['local.get', `$${pair}`])])
@@ -185,7 +187,7 @@ export default (ctx) => {
         updateRep(target, { schemaId })
         const t = tempI32('bx'), s = temp('bs')
         const body = [
-          ['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, boxedSchema.length)], ['i32.const', 8]]],
+          ['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, boxedSchema.length)]]],
           ['f64.store', ['local.get', `$${t}`], asF64(emit(target))],
         ]
         const sBase = tempI32('sb')
@@ -266,6 +268,7 @@ export default (ctx) => {
       // Header propsPtr lives at $off-16 (current ARRAY layout). We alias src's hash
       // by copying the slot; __dyn_move covers the shifted-array case where props
       // were migrated to the global __dyn_props.
+      includeModule('array')
       inc('__arr_from', '__dyn_move', '__ptr_offset')
       const src = temp('ocs')
       const dst = temp('ocd')
@@ -288,6 +291,7 @@ export default (ctx) => {
     if (!schema) {
       if (protoType == null) {
         const value = temp('ocr')
+        includeModule('array')
         inc('__arr_from', '__dyn_move', '__ptr_offset')
         const dst2 = temp('ocd')
         const srcOff2 = tempI32('ocso')
@@ -317,7 +321,7 @@ export default (ctx) => {
     const srcBase = tempI32('cb')
     const body = [
       ['local.set', `$${s}`, asF64(emit(proto))],
-      ['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, n)], ['i32.const', 8]]],
+      ['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, n)]]],
       ['local.set', `$${srcBase}`, ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${s}`]]]],
     ]
     // Copy all properties from proto
@@ -378,7 +382,7 @@ function emitObjectSpread(props, spreadTarget = takeLiteralTarget()) {
   const ptr = temp('objp')
   const src = tempI32('osp')
 
-  const body = [['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)], ['i32.const', 8]]]]
+  const body = [['local.set', `$${t}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)]]]]
 
   // Process props in order — later props override earlier (JS semantics)
   let srcF
@@ -462,6 +466,13 @@ function emitHashValues(obj) {
     hashValuesFromTemp(t)], 'f64')
 }
 
+function emitHashEntries(obj) {
+  const t = temp('he')
+  return typed(['block', ['result', 'f64'],
+    ['local.set', `$${t}`, asF64(emit(obj))],
+    hashEntriesFromTemp(t)], 'f64')
+}
+
 // Inline body of the HASH walk against an already-bound f64 local. Shared by
 // the static-HASH path and the runtime-dispatch path so both produce the same
 // IR shape from the same source — only difference is whether they enter from
@@ -520,6 +531,37 @@ function hashValuesFromTemp(t) {
     out.ptr]
 }
 
+function hashEntriesFromTemp(t) {
+  inc('__ptr_offset', '__cap', '__len', '__alloc_hdr')
+  const off = tempI32('heo'), cap = tempI32('hec'), n = tempI32('hen')
+  const i = tempI32('hei'), o = tempI32('hej'), slot = tempI32('hes'), pair = tempI32('hep')
+  const out = allocPtr({ type: PTR.ARRAY, len: ['local.get', `$${n}`], tag: 'hea' })
+  const id = ctx.func.uniq++
+  return ['block', ['result', 'f64'],
+    ['local.set', `$${n}`, ['call', '$__len', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]],
+    out.init,
+    ['local.set', `$${off}`, ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]],
+    ['local.set', `$${cap}`, ['call', '$__cap', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]],
+    ['local.set', `$${i}`, ['i32.const', 0]],
+    ['local.set', `$${o}`, ['i32.const', 0]],
+    ['block', `$ebrk${id}`, ['loop', `$eloop${id}`,
+      ['br_if', `$ebrk${id}`, ['i32.ge_s', ['local.get', `$${i}`], ['local.get', `$${cap}`]]],
+      ['local.set', `$${slot}`, ['i32.add', ['local.get', `$${off}`],
+        ['i32.mul', ['local.get', `$${i}`], ['i32.const', 24]]]],
+      ['if', ['f64.ne', ['f64.load', ['local.get', `$${slot}`]], ['f64.const', 0]],
+        ['then',
+          ['local.set', `$${pair}`, ['call', '$__alloc_hdr', ['i32.const', 2], ['i32.const', 2]]],
+          ['f64.store', ['local.get', `$${pair}`],
+            ['f64.load', ['i32.add', ['local.get', `$${slot}`], ['i32.const', 8]]]],
+          ['f64.store', ['i32.add', ['local.get', `$${pair}`], ['i32.const', 8]],
+            ['f64.load', ['i32.add', ['local.get', `$${slot}`], ['i32.const', 16]]]],
+          elemStore(out.local, o, mkPtrIR(PTR.ARRAY, 0, ['local.get', `$${pair}`])),
+          ['local.set', `$${o}`, ['i32.add', ['local.get', `$${o}`], ['i32.const', 1]]]]],
+      ['local.set', `$${i}`, ['i32.add', ['local.get', `$${i}`], ['i32.const', 1]]],
+      ['br', `$eloop${id}`]]],
+    out.ptr]
+}
+
 // Type-unknown receiver: bind the value, branch on ptr-type. HASH walks the
 // probe table; OBJECT loads the schema's key array (registered statically at
 // compile time or lazily at runtime by JSON.parse via __jp_schema_get); other
@@ -568,6 +610,26 @@ function emitRuntimeValues(obj) {
         ['else', ['block', ['result', 'f64'], empty.init, empty.ptr]]]]]], 'f64')
 }
 
+function emitRuntimeEntries(obj) {
+  inc('__ptr_type')
+  if (!ctx.scope.globals.has('__schema_tbl'))
+    ctx.scope.globals.set('__schema_tbl', '(global $__schema_tbl (mut i32) (i32.const 0))')
+  const t = temp('re'), tt = tempI32('ret')
+  const empty = allocPtr({ type: PTR.ARRAY, len: 0, tag: 'ree' })
+  return typed(['block', ['result', 'f64'],
+    ['local.set', `$${t}`, asF64(emit(obj))],
+    ['local.set', `$${tt}`, ['call', '$__ptr_type', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]],
+    ['if', ['result', 'f64'],
+      ['i32.eq', ['local.get', `$${tt}`], ['i32.const', PTR.HASH]],
+      ['then', hashEntriesFromTemp(t)],
+      ['else', ['if', ['result', 'f64'],
+        ['i32.and',
+          ['i32.eq', ['local.get', `$${tt}`], ['i32.const', PTR.OBJECT]],
+          ['i32.ne', ['global.get', '$__schema_tbl'], ['i32.const', 0]]],
+        ['then', objectEntriesFromTemp(t)],
+        ['else', ['block', ['result', 'f64'], empty.init, empty.ptr]]]]]], 'f64')
+}
+
 // Schema-keyed Object.keys: copy the schema's keys array (a jz Array of
 // STRINGs registered in __schema_tbl[sid]) into a fresh ARRAY so callers can
 // mutate without aliasing the schema substrate.
@@ -584,7 +646,7 @@ function objectKeysFromTemp(t) {
       ['i64.const', LAYOUT.OFFSET_MASK]]]],
     ['local.set', `$${n}`, ['i32.load', ['i32.sub', ['local.get', `$${src}`], ['i32.const', 8]]]],
     ['local.set', `$${out}`, ['call', '$__alloc_hdr',
-      ['local.get', `$${n}`], ['local.get', `$${n}`], ['i32.const', 8]]],
+      ['local.get', `$${n}`], ['local.get', `$${n}`]]],
     ['local.set', `$${i}`, ['i32.const', 0]],
     ['block', `$kbrk${id}`, ['loop', `$kloop${id}`,
       ['br_if', `$kbrk${id}`, ['i32.ge_s', ['local.get', `$${i}`], ['local.get', `$${n}`]]],
@@ -612,7 +674,7 @@ function objectValuesFromTemp(t) {
     ['local.set', `$${n}`, ['i32.load', ['i32.sub', ['local.get', `$${src}`], ['i32.const', 8]]]],
     ['local.set', `$${base}`, ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]],
     ['local.set', `$${out}`, ['call', '$__alloc_hdr',
-      ['local.get', `$${n}`], ['local.get', `$${n}`], ['i32.const', 8]]],
+      ['local.get', `$${n}`], ['local.get', `$${n}`]]],
     ['local.set', `$${i}`, ['i32.const', 0]],
     ['block', `$ovbrk${id}`, ['loop', `$ovloop${id}`,
       ['br_if', `$ovbrk${id}`, ['i32.ge_s', ['local.get', `$${i}`], ['local.get', `$${n}`]]],
@@ -622,5 +684,41 @@ function objectValuesFromTemp(t) {
           ['i32.add', ['local.get', `$${base}`], ['i32.shl', ['local.get', `$${i}`], ['i32.const', 3]]]]],
       ['local.set', `$${i}`, ['i32.add', ['local.get', `$${i}`], ['i32.const', 1]]],
       ['br', `$ovloop${id}`]]],
+    mkPtrIR(PTR.ARRAY, 0, ['local.get', `$${out}`])]
+}
+
+function objectEntriesFromTemp(t) {
+  inc('__alloc_hdr', '__ptr_offset')
+  const sid = tempI32('oes'), src = tempI32('oesrc'), n = tempI32('oen')
+  const base = tempI32('oebase'), out = tempI32('oeo'), i = tempI32('oei'), pair = tempI32('oep')
+  const id = ctx.func.uniq++
+  return ['block', ['result', 'f64'],
+    ['local.set', `$${sid}`, ['i32.wrap_i64', ['i64.and',
+      ['i64.shr_u', ['i64.reinterpret_f64', ['local.get', `$${t}`]], ['i64.const', LAYOUT.AUX_SHIFT]],
+      ['i64.const', LAYOUT.AUX_MASK]]]],
+    ['local.set', `$${src}`, ['i32.wrap_i64', ['i64.and',
+      ['i64.load', ['i32.add', ['global.get', '$__schema_tbl'], ['i32.shl', ['local.get', `$${sid}`], ['i32.const', 3]]]],
+      ['i64.const', LAYOUT.OFFSET_MASK]]]],
+    ['local.set', `$${n}`, ['i32.load', ['i32.sub', ['local.get', `$${src}`], ['i32.const', 8]]]],
+    ['local.set', `$${base}`, ['call', '$__ptr_offset', ['i64.reinterpret_f64', ['local.get', `$${t}`]]]],
+    ['local.set', `$${out}`, ['call', '$__alloc_hdr',
+      ['local.get', `$${n}`], ['local.get', `$${n}`]]],
+    ['local.set', `$${i}`, ['i32.const', 0]],
+    ['block', `$oebrk${id}`, ['loop', `$oeloop${id}`,
+      ['br_if', `$oebrk${id}`, ['i32.ge_s', ['local.get', `$${i}`], ['local.get', `$${n}`]]],
+      ['local.set', `$${pair}`, ['call', '$__alloc_hdr', ['i32.const', 2], ['i32.const', 2]]],
+      ['i64.store',
+        ['local.get', `$${pair}`],
+        ['i64.load',
+          ['i32.add', ['local.get', `$${src}`], ['i32.shl', ['local.get', `$${i}`], ['i32.const', 3]]]]],
+      ['f64.store',
+        ['i32.add', ['local.get', `$${pair}`], ['i32.const', 8]],
+        ['f64.load',
+          ['i32.add', ['local.get', `$${base}`], ['i32.shl', ['local.get', `$${i}`], ['i32.const', 3]]]]],
+      ['f64.store',
+        ['i32.add', ['local.get', `$${out}`], ['i32.shl', ['local.get', `$${i}`], ['i32.const', 3]]],
+        mkPtrIR(PTR.ARRAY, 0, ['local.get', `$${pair}`])],
+      ['local.set', `$${i}`, ['i32.add', ['local.get', `$${i}`], ['i32.const', 1]]],
+      ['br', `$oeloop${id}`]]],
     mkPtrIR(PTR.ARRAY, 0, ['local.get', `$${out}`])]
 }

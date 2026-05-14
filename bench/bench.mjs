@@ -160,7 +160,10 @@ const compileJzHost = c => {
       env: { logResult: { params: 5 } },
       performance: { now: { params: 0, returns: 'number' } },
     },
-    optimize: { scalarTypedArrayLen: 16, scalarTypedLoopUnroll: 8, ...(isWatr ? { watr: false, smallConstForUnroll: false } : {}), ...(process.env.JZ_SIMD ? { vectorizeLaneLocal: true } : {}) },
+    // All benches compile at level 'speed' — full watr inlining + L3 cap/hash
+    // tuning. If any pass at this level produces wrong checksums or crashes,
+    // that's an optimizer bug to be fixed, not a reason to back off.
+    optimize: { level: 'speed', ...(process.env.JZ_SIMD ? { vectorizeLaneLocal: true } : {}) },
     alloc: false,
   })
   writeFileSync(jzHostWasmPath(c), wasm)

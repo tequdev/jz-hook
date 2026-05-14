@@ -251,7 +251,13 @@ export default (ctx) => {
   ctx.core.emit['new.Array'] = (len) => {
     const n = tempI32('alen')
     const nIR = ['local.get', `$${n}`]
-    const out = allocPtr({ type: PTR.ARRAY, len: nIR, cap: nIR, tag: 'newarr' })
+    // L3/'speed' bumps the cap floor to skip the first growth cycles (default 0
+    // → grow on first push). Length stays exactly what the user requested.
+    const minCap = ctx.transform.optimize?.arrayMinCap | 0
+    const capIR = minCap > 0
+      ? ['select', ['i32.const', minCap], nIR, ['i32.gt_s', ['i32.const', minCap], nIR]]
+      : nIR
+    const out = allocPtr({ type: PTR.ARRAY, len: nIR, cap: capIR, tag: 'newarr' })
     return typed(['block', ['result', 'f64'],
       ['local.set', `$${n}`, len == null ? ['i32.const', 0] : asI32(emit(len))],
       out.init,
@@ -378,7 +384,7 @@ export default (ctx) => {
   ctx.core.stdlib['__arr_from'] = `(func $__arr_from (param $src i64) (result f64)
     (local $len i32) (local $dst i32)
     (local.set $len (call $__len (local.get $src)))
-    (local.set $dst (call $__alloc_hdr (local.get $len) (local.get $len) (i32.const 8)))
+    (local.set $dst (call $__alloc_hdr (local.get $len) (local.get $len)))
     (memory.copy (local.get $dst) (call $__ptr_offset (local.get $src)) (i32.shl (local.get $len) (i32.const 3)))
     (call $__mkptr (i32.const ${PTR.ARRAY}) (i32.const 0) (local.get $dst)))`
 
@@ -434,7 +440,7 @@ export default (ctx) => {
         (i32.lt_u (local.get $off) (i32.const 8)))
       (then
         (local.set $newCap (select (local.get $minCap) (i32.const 4) (i32.gt_s (local.get $minCap) (i32.const 4))))
-        (local.set $newOff (call $__alloc_hdr (i32.const 0) (local.get $newCap) (i32.const 8)))
+        (local.set $newOff (call $__alloc_hdr (i32.const 0) (local.get $newCap)))
         (return (call $__mkptr (i32.const ${PTR.ARRAY}) (i32.const 0) (local.get $newOff)))))
     (local.set $oldCap (i32.load (i32.sub (local.get $off) (i32.const 4))))
     (if (i32.ge_s (local.get $oldCap) (local.get $minCap))
@@ -444,7 +450,7 @@ export default (ctx) => {
       (i32.shl (local.get $oldCap) (i32.const 1))
       (i32.gt_s (local.get $minCap) (i32.shl (local.get $oldCap) (i32.const 1)))))
     (local.set $len (i32.load (i32.sub (local.get $off) (i32.const 8))))
-    (local.set $newOff (call $__alloc_hdr (local.get $len) (local.get $newCap) (i32.const 8)))
+    (local.set $newOff (call $__alloc_hdr (local.get $len) (local.get $newCap)))
     (memory.copy (local.get $newOff) (local.get $off) (i32.shl (local.get $len) (i32.const 3)))
     ${headerPropsCopyIR()}
     ${maybeDynMoveIR()}
@@ -464,7 +470,7 @@ export default (ctx) => {
       (i32.shl (local.get $oldCap) (i32.const 1))
       (i32.gt_s (local.get $minCap) (i32.shl (local.get $oldCap) (i32.const 1)))))
     (local.set $len (i32.load (i32.sub (local.get $off) (i32.const 8))))
-    (local.set $newOff (call $__alloc_hdr (local.get $len) (local.get $newCap) (i32.const 8)))
+    (local.set $newOff (call $__alloc_hdr (local.get $len) (local.get $newCap)))
     (memory.copy (local.get $newOff) (local.get $off) (i32.shl (local.get $len) (i32.const 3)))
     ${headerPropsCopyIR()}
     ${maybeDynMoveIR()}
@@ -522,7 +528,9 @@ export default (ctx) => {
         const slots = elems.map(e => extractF64Bits(asF64(emit(e))))
         if (slots.every(b => b !== null)) return staticArrayPtr(slots)
       }
-      const a = allocArray(len, Math.max(len, 4))  // min cap=4 for small pushes
+      // L3/'speed' bumps the cap floor (default 4) to skip more growth cycles.
+      const minCap = Math.max(ctx.transform.optimize?.arrayMinCap | 0, 4)
+      const a = allocArray(len, Math.max(len, minCap))
       const body = [...a.setup]
       for (let i = 0; i < len; i++)
         body.push(['f64.store', slotAddr(a.local, i), asF64(emit(elems[i]))])
@@ -530,7 +538,8 @@ export default (ctx) => {
       return typed(['block', ['result', 'f64'], ...body], 'f64')
     }
 
-    const a = allocArray(0, Math.max(elems.length, 4))
+    const minCap = Math.max(ctx.transform.optimize?.arrayMinCap | 0, 4)
+    const a = allocArray(0, Math.max(elems.length, minCap))
     const out = temp('sa'), pos = tempI32('sp')
     inc('__arr_set_idx_ptr')
 

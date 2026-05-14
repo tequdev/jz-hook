@@ -539,7 +539,7 @@ export function emitDecl(...inits) {
         ctx.func.locals.set(innerName, 'f64')
         result.push(
           ['local.set', `$${innerName}`, ['local.get', `$${name}`]],
-          ['local.set', `$${bt}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)], ['i32.const', 8]]],
+          ['local.set', `$${bt}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)]]],
           ['f64.store', ['local.get', `$${bt}`], ['local.get', `$${name}`]],
           ...schema.slice(1).map((_, j) =>
             ['f64.store', ['i32.add', ['local.get', `$${bt}`], ['i32.const', (j + 1) * 8]], ['f64.const', 0]]),
@@ -1958,6 +1958,7 @@ export const emitter = {
           const callIR = typed(['call', `$${fname}`, ...emittedArgs], func.sig.results[0])
           if (func.sig.ptrKind != null) callIR.ptrKind = func.sig.ptrKind
           if (func.sig.ptrAux != null) callIR.ptrAux = func.sig.ptrAux
+          if (func.sig.unsignedResult) callIR.unsigned = true
           return callIR
         }
       }
@@ -2361,6 +2362,7 @@ export const emitter = {
           arrayIR], func.sig.results[0])
         if (func.sig.ptrKind != null) callIR.ptrKind = func.sig.ptrKind
         if (func.sig.ptrAux != null) callIR.ptrAux = func.sig.ptrAux
+        if (func.sig.unsignedResult) callIR.unsigned = true
         return callIR
       }
 
@@ -2388,6 +2390,9 @@ export const emitter = {
       const callIR = typed(callNode, func?.sig.results[0] || 'f64')
       if (func?.sig.ptrKind != null) callIR.ptrKind = func.sig.ptrKind
       if (func?.sig.ptrAux != null) callIR.ptrAux = func.sig.ptrAux
+      // Unsigned-uint32 result (every tail was `>>>`): consumer's asF64 must use
+      // `f64.convert_i32_u` instead of `_s`, preserving the [0, 2^32) range.
+      if (func?.sig.unsignedResult) callIR.unsigned = true
       return callIR
     }
 

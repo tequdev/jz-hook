@@ -11,6 +11,7 @@
 import { typed, asF64, asI64, asI32, NULL_NAN, UNDEF_NAN, temp, tempI32, tempI64, allocPtr, undefExpr } from '../src/ir.js'
 import { emit, emitFlat } from '../src/emit.js'
 import { valTypeOf, lookupValType, VAL } from '../src/analyze.js'
+import { hasOwnContinue } from '../src/ast.js'
 import { inc, PTR, LAYOUT } from '../src/ctx.js'
 
 const SET_ENTRY = 16  // hash + key
@@ -186,7 +187,7 @@ function genUpsertGrow(name, entrySize, hashFn, eqExpr, typeConst, strict = fals
     (if (i32.ge_s (i32.mul (local.get $size) (i32.const 4)) (i32.mul (local.get $cap) (i32.const 3)))
       (then
         (local.set $newcap (i32.shl (local.get $cap) (i32.const 1)))
-        (local.set $newptr (call $__alloc_hdr (i32.const 0) (local.get $newcap) (i32.const ${entrySize})))
+        (local.set $newptr (call $__alloc_hdr_n (i32.const 0) (local.get $newcap) (i32.const ${entrySize})))
         (local.set $i (i32.const 0))
         (block $rd (loop $rl
           (br_if $rd (i32.ge_s (local.get $i) (local.get $cap)))
@@ -335,14 +336,14 @@ export default (ctx) => {
     __hash_has: () => ctx.features.external
       ? ['__str_hash', '__str_eq', '__ptr_type', '__ext_has']
       : ['__str_hash', '__str_eq', '__ptr_type'],
-    __hash_new: ['__alloc_hdr'],
-    __hash_new_small: ['__alloc_hdr', '__mkptr'],
+    __hash_new: ['__alloc_hdr_n'],
+    __hash_new_small: ['__alloc_hdr_n', '__mkptr'],
     __hash_get_local: ['__str_hash', '__str_eq'],
     __hash_get_local_h: ['__str_eq'],
     __hash_set_local_h: ['__str_eq'],
-    __hash_set_local: ['__str_hash', '__str_eq'],
+    __hash_set_local: ['__str_hash', '__str_eq', '__alloc_hdr_n', '__mkptr'],
     __ihash_get_local: ['__map_hash'],
-    __ihash_set_local: ['__map_hash', '__alloc_hdr', '__mkptr'],
+    __ihash_set_local: ['__map_hash', '__alloc_hdr_n', '__mkptr'],
     __dyn_get_t: ['__dyn_get_t_h', '__str_hash'],
     __dyn_get_t_h: ['__ihash_get_local', '__str_eq', '__is_nullish'],
     __dyn_get: ['__dyn_get_t', '__ptr_type'],
@@ -437,7 +438,7 @@ export default (ctx) => {
   // __map_new() → f64 — allocate empty Map (for JSON.parse, runtime creation)
   ctx.core.stdlib['__map_new'] = `(func $__map_new (result f64)
     (call $__mkptr (i32.const ${PTR.MAP}) (i32.const 0)
-      (call $__alloc_hdr (i32.const 0) (i32.const ${INIT_CAP}) (i32.const ${MAP_ENTRY}))))`
+      (call $__alloc_hdr_n (i32.const 0) (i32.const ${INIT_CAP}) (i32.const ${MAP_ENTRY}))))`
 
   // === Set ===
 
@@ -567,14 +568,17 @@ export default (ctx) => {
 
   ctx.core.stdlib['__hash_new'] = `(func $__hash_new (result f64)
     (call $__mkptr (i32.const ${PTR.HASH}) (i32.const 0)
-      (call $__alloc_hdr (i32.const 0) (i32.const ${INIT_CAP}) (i32.const ${MAP_ENTRY}))))`
+      (call $__alloc_hdr_n (i32.const 0) (i32.const ${INIT_CAP}) (i32.const ${MAP_ENTRY}))))`
 
   // Small initial capacity for propsPtr-style hashes (per-object dyn props).
   // Most receivers in real code carry 0-2 dyn props; paying 8-slot up-front
   // is wasted memory + probe-loop cache pressure. Grows to 4/8/... on demand.
+  // L3/'speed' opts into a larger initial cap (default 8) to skip 2→4→8 growth
+  // when AST-style nodes carry 3-5 props (watr.compile's profile).
+  const smallCap = Math.max(ctx.transform.optimize?.hashSmallInitCap | 0, 2)
   ctx.core.stdlib['__hash_new_small'] = `(func $__hash_new_small (result f64)
     (call $__mkptr (i32.const ${PTR.HASH}) (i32.const 0)
-      (call $__alloc_hdr (i32.const 0) (i32.const 2) (i32.const ${MAP_ENTRY}))))`
+      (call $__alloc_hdr_n (i32.const 0) (i32.const ${smallCap}) (i32.const ${MAP_ENTRY}))))`
 
   ctx.core.stdlib['__hash_get_local'] = genLookupStrict('__hash_get_local', MAP_ENTRY, '$__str_hash', strEq, PTR.HASH)
   ctx.core.stdlib['__hash_get_local_h'] = genLookupStrictPrehashed('__hash_get_local_h', MAP_ENTRY, strEq, PTR.HASH)
@@ -709,6 +713,11 @@ export default (ctx) => {
             (br_if $haveProps (i32.eq
               (i32.wrap_i64 (i64.and (i64.shr_u (local.get $props) (i64.const ${LAYOUT.TAG_SHIFT})) (i64.const ${LAYOUT.TAG_MASK})))
               (i32.const ${PTR.HASH})))
+            ;; Fresh array (header propsPtr=0, no shift, no props): skip the
+            ;; global hash probe — there's nothing to find. Shifted arrays read
+            ;; forwarding bytes here (low32=newOff, high32=-1) → non-zero, so
+            ;; this br_if doesn't fire and they fall through to __dyn_props.
+            (br_if $dynDone (i64.eqz (local.get $props)))
             (local.set $props (i64.const 0))))
         ;; OBJECT: heap-allocated (off >= __heap_start) carries propsPtr at
         ;; off-16 from __alloc_hdr. The slot is either 0 (no dyn props yet) or
@@ -1032,8 +1041,14 @@ export default (ctx) => {
     const ptrI64 = tempI64('hp'), srcOff = tempI32('hso'), srcType = tempI32('hst')
     if (!ctx.func.locals.has(varName)) ctx.func.locals.set(varName, 'f64')
     const id = ctx.func.uniq++
+    const brk = `$brk${id}`, loop = `$loop${id}`, cont = `$cont${id}`
     const va = asF64(emit(src))
-    const bodyFlat = emitFlat(body)
+    const needsCont = hasOwnContinue(body)
+    ctx.func.stack.push({ brk, loop: needsCont ? cont : loop })
+    let bodyFlat
+    try { bodyFlat = emitFlat(body) }
+    finally { ctx.func.stack.pop() }
+    const bodyBlock = needsCont ? [['block', cont, ...bodyFlat]] : bodyFlat
     inc('__ptr_type')
     return [
       // Save source ptr as i64
@@ -1054,16 +1069,16 @@ export default (ctx) => {
           ['local.set', `$${off}`, ['call', '$__ptr_offset', ['local.get', `$${ptrI64}`]]],
           ['local.set', `$${cap}`, ['call', '$__cap', ['local.get', `$${ptrI64}`]]],
           ['local.set', `$${i}`, ['i32.const', 0]],
-          ['block', `$brk${id}`, ['loop', `$loop${id}`,
-            ['br_if', `$brk${id}`, ['i32.ge_s', ['local.get', `$${i}`], ['local.get', `$${cap}`]]],
+          ['block', brk, ['loop', loop,
+            ['br_if', brk, ['i32.ge_s', ['local.get', `$${i}`], ['local.get', `$${cap}`]]],
             ['local.set', `$${slot}`, ['i32.add', ['local.get', `$${off}`],
               ['i32.mul', ['local.get', `$${i}`], ['i32.const', MAP_ENTRY]]]],
             ['if', ['i64.ne', ['i64.load', ['local.get', `$${slot}`]], ['i64.const', 0]],
               ['then',
                 ['local.set', `$${varName}`, ['f64.reinterpret_i64', ['i64.load', ['i32.add', ['local.get', `$${slot}`], ['i32.const', 8]]]]],
-                ...bodyFlat]],
+                ...bodyBlock]],
             ['local.set', `$${i}`, ['i32.add', ['local.get', `$${i}`], ['i32.const', 1]]],
-            ['br', `$loop${id}`]]]]]
+            ['br', loop]]]]]
     ]
   }
 }

@@ -35,6 +35,9 @@ npm install -g jz-hook
 # Compile a Hook
 jz-hook  hook.js -o hook.wasm
 
+# Optimization level: -O0 off, -O1 size, -O2 balanced, -O3 speed
+jz program.js -O3
+
 # View generated WAT
 jz-hook --wat hook.js
 

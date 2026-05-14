@@ -1,12 +1,14 @@
 {
   "name": "jz-hook",
-  "version": "0.2.1-hook.1",
+  "version": "0.4.0-hook.1",
   "description": "Modern functional JS compiling to WASM — optimized for Xahau Hook smart contracts",
   "main": "index.js",
   "type": "module",
   "exports": {
     ".": "./index.js",
     "./wasi": "./wasi.js",
+    "./interop": "./interop/nanbox.js",
+    "./interop/nanbox": "./interop/nanbox.js",
     "./types": "./types/hook.d.ts"
   },
   "files": [
@@ -15,6 +17,7 @@
     "wasi.js",
     "src",
     "module",
+    "interop",
     "types",
     "README.md"
   ],
@@ -48,8 +51,8 @@
   "author": "Dmitry Iv",
   "license": "MIT",
   "dependencies": {
-    "subscript": "^10.4.7",
-    "watr": "^4.5.3"
+    "subscript": "^10.4.8",
+    "watr": "^4.6.5"
   },
   "keywords": [
     "javascript",

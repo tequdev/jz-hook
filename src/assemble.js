@@ -13,7 +13,7 @@
  */
 
 import { parse as parseWat } from 'watr'
-import { ctx, inc, resolveIncludes, PTR, LAYOUT } from './ctx.js'
+import { ctx, inc, resolveIncludes, err, PTR, LAYOUT } from './ctx.js'
 
 // Stdlib WAT templates are fixed text (or feature-keyed text from a factory) —
 // `parseWat` of the same string always yields the same tree. Parsing is the
@@ -55,7 +55,7 @@ const heapSetIR = value => ctx.memory.shared
   : ['global.set', '$__heap', value]
 
 const ARENA_SAFE_CALLS = new Set([
-  '$__alloc', '$__alloc_hdr', '$__mkptr',
+  '$__alloc', '$__alloc_hdr', '$__alloc_hdr_n', '$__mkptr',
   '$__ptr_offset', '$__ptr_type', '$__ptr_aux',
   '$__len', '$__cap', '$__typed_shift', '$__typed_data',
 ])
@@ -79,7 +79,7 @@ function applyArenaRewind(func, fn, safeCallees) {
     }
     if (op === 'call') {
       const name = node[1]
-      if (name === '$__alloc' || name === '$__alloc_hdr') hasAlloc = true
+      if (name === '$__alloc' || name === '$__alloc_hdr' || name === '$__alloc_hdr_n') hasAlloc = true
       if (!(safeCallees ?? ARENA_SAFE_CALLS).has(name)) {
         unsafe = true
         return
@@ -173,7 +173,7 @@ export function buildStartFn(ast, sec, closureFuncs, compilePendingClosures) {
     for (const [name, { schemaId, schema }] of ctx.schema.autoBox) {
       inc('__alloc_hdr', '__mkptr')
       boxInit.push(
-        ['local.set', `$${bt}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)], ['i32.const', 8]]],
+        ['local.set', `$${bt}`, ['call', '$__alloc_hdr', ['i32.const', 0], ['i32.const', Math.max(1, schema.length)]]],
         ['f64.store', ['local.get', `$${bt}`],
           ctx.func.names.has(name) ? ['f64.const', 0] : ['global.get', `$${name}`]],
         ...schema.slice(1).map((_, i) =>
@@ -214,7 +214,7 @@ export function buildStartFn(ast, sec, closureFuncs, compilePendingClosures) {
       const keys = ctx.schema.list[s]
       const n = keys.length
       schemaInit.push(
-        ['local.set', `$${sarr}`, ['call', '$__alloc_hdr', ['i32.const', n], ['i32.const', n], ['i32.const', 8]]])
+        ['local.set', `$${sarr}`, ['call', '$__alloc_hdr', ['i32.const', n], ['i32.const', n]]])
       for (let k = 0; k < n; k++)
         schemaInit.push(
           ['f64.store', ['i32.add', ['local.get', `$${sarr}`], ['i32.const', k * 8]],
@@ -419,7 +419,7 @@ export function pullStdlib(sec) {
       ctx.core.includes.delete(name)
     }
   }
-  for (const n of ctx.core.includes) if (!ctx.core.stdlib[n]) console.error("MISSING stdlib:", n)
+  for (const n of ctx.core.includes) if (!ctx.core.stdlib[n]) err(`internal: stdlib '${n}' was requested but never registered (this is a jz bug — feature pulled in something it can't deliver)`)
   sec.stdlib.push(...[...ctx.core.includes].map(n => parseTemplate(stdlibStr(n))))
 }
 
@@ -469,7 +469,11 @@ export function optimizeModule(sec) {
     }
   }
   if (!cfg || cfg.hoistConstantPool !== false)
-    hoistConstantPool([...sec.funcs, ...sec.stdlib, ...sec.start], (name, wat) => ctx.scope.globals.set(name, wat))
+    hoistConstantPool([...sec.funcs, ...sec.stdlib, ...sec.start], (name, wat) => {
+      ctx.scope.globals.set(name, wat)
+      const m = wat.match(/\(global\s+\$?\S+\s+(?:\(mut\s+)?(i32|i64|f64|f32)/)
+      if (m) ctx.scope.globalTypes.set(name, m[1])
+    })
 
   // Second promoteGlobals pass disabled: promoting hoistConstantPool's __fc*
   // globals regressed the watr perf micro-pin (WASM compile time increased).

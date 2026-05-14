@@ -33,7 +33,9 @@
  * Feature flags (ctx.features.*) gate conditional stdlib branches for dead-code elimination.
  * Capability hooks (ctx.schema.register, ctx.closure.make) are installed by capability modules.
  *
- * Interop host layer (memory marshaling, wrap, instantiate) lives in src/host.js.
+ * Interop host layer (memory marshaling, wrap, instantiate) lives in
+ * interop/nanbox.js — also exported as the standalone `jz/interop` subpath
+ * for hosts that want to run prebuilt jz wasm without pulling the compiler.
  *
  * @module jz
  */
@@ -49,7 +51,7 @@ import { detectOptimizeConfig } from './src/auto-config.js'
 import jzify from './src/jzify.js'
 import {
   memory as enhanceMemory, instantiate as instantiateRuntime,
-} from './src/host.js'
+} from './interop/nanbox.js'
 import { validateHook } from './src/hook-validate.js'
 
 // A host import that's a JS function may hand back any value, including a host
@@ -179,6 +181,20 @@ jz.memory = enhanceMemory
  * @returns {Uint8Array|string}
  */
 jz.compile = (code, opts = {}) => {
+  try {
+    return jzCompileInner(code, opts)
+  } catch (e) {
+    // Any uncaught native exception (TypeError, ReferenceError, etc.) is a jz
+    // codegen leak — surface it as an internal compile error with the source
+    // location we were standing on. err()-thrown errors already pass through.
+    if (e?.name === 'TypeError' || e?.name === 'ReferenceError' || e?.name === 'RangeError') {
+      err(`internal: ${e.message} (jz hit an unsupported case while compiling${ctx.error.node ? '; the AST node above shows the trigger' : ''}). This is a jz bug — please report.`)
+    }
+    throw e
+  }
+}
+
+const jzCompileInner = (code, opts = {}) => {
   const profiler = compileProfiler(opts.profile)
   const time = (name, fn) => profiler ? profiler.time(name, fn) : fn()
 
@@ -284,7 +300,26 @@ jz.compile = (code, opts = {}) => {
   }
 
   const cfg = ctx.transform.optimize
-  const optimized = cfg.watr ? time('watrOptimize', () => watrOptimize(module)) : module
+  // watr's `loopify` collapses the `(block $brk (loop … (br_if $brk !cond) … (br $loop)))`
+  // idiom into `(loop … (if cond …))` — sound, but destroys the exact shape jz's
+  // post-watr vectorizer scans for. Disable loopify when vectorize is going to run.
+  //
+  // watr config:
+  //   true / 'full' → all default passes (includes `inlineOnce` / `inline` / `coalesce`)
+  //   'light'       → everything except inlining + coalesce. Default at level 2.
+  //                   `inlineOnce` reshapes codegen the way slot-type / LICM tests scan for,
+  //                   and miscompiles regex `split(/\s+/)`. `coalesceLocals` on its own (i.e.
+  //                   without the cleanup that follows inlining) breaks `/a.+b/.test("ab")`
+  //                   — likely a stale alias the post-inline propagate sweep normally tidies
+  //                   up at L3. Dropping both still keeps treeshake / dedupe / dedupTypes /
+  //                   propagate / packData / fold / peephole / vacuum / mergeBlocks / brif /
+  //                   loopify / offset / unbranch / identity / strength / globals etc.
+  //   false         → skip watr entirely (level 0/1).
+  let watrOpts
+  if (cfg.watr === 'light') watrOpts = { inline: false, inlineOnce: false, coalesce: false, loopify: !cfg.vectorizeLaneLocal }
+  else if (cfg.vectorizeLaneLocal) watrOpts = { loopify: false }
+  else watrOpts = true
+  const optimized = cfg.watr ? time('watrOptimize', () => watrOptimize(module, watrOpts)) : module
   // Final peephole pass: watrOptimize's inliner can re-introduce rebox/unbox at boundaries
   // (e.g. inlined closure body's `i32.wrap_i64 (i64.reinterpret_f64 __env)` next to caller's
   // `boxPtrIR(g)` rebox). Our fusedRewrite folds these, watr's peephole doesn't.
@@ -297,16 +332,32 @@ jz.compile = (code, opts = {}) => {
       for (const node of optimized) if (Array.isArray(node) && node[0] === 'func') optimizeFunc(node, postCfg, globalTypesMap)
     })
   }
-  if (opts.wat) return time('watrPrint', () => watrPrint(optimized))
-  const wasm = time('watrCompile', () => watrCompile(optimized))
-  const namedWasm = (opts.profileNames || opts.profile?.names) ? appendFunctionNames(wasm, optimized) : wasm
-  // Hook validation: run automatically when host='hook' (or when --validate is explicitly passed).
-  // The validate pass is fast and provides essential early feedback about Hook binary compliance.
-  if (ctx.transform.host === 'hook' || opts.validate) {
-    const result = validateHook(namedWasm)
-    if (opts.verbose) process.stderr.write(`Hook validated: ${result.bytes} bytes\n`)
+  try {
+    if (opts.wat) return time('watrPrint', () => watrPrint(optimized))
+    const wasm = time('watrCompile', () => watrCompile(optimized))
+    const namedWasm = (opts.profileNames || opts.profile?.names) ? appendFunctionNames(wasm, optimized) : wasm
+    // Hook validation: run automatically when host='hook' (or when --validate is explicitly passed).
+    // The validate pass is fast and provides essential early feedback about Hook binary compliance.
+    if (ctx.transform.host === 'hook' || opts.validate) {
+      const result = validateHook(namedWasm)
+      if (opts.verbose) process.stderr.write(`Hook validated: ${result.bytes} bytes\n`)
+    }
+    return namedWasm
+  } catch (e) {
+    // watr surfaces dangling identifiers as "Unknown local|func|global|table|memory $X".
+    // That's always a jz codegen leak — we emitted IR that references something never
+    // declared (typically: a built-in / stdlib we don't implement). Rewrite to a clean
+    // user-facing message instead of leaking watr internals.
+    const m = /Unknown (local|func|global|table|memory|type) \$?(\S+)/.exec(e?.message || '')
+    if (m) {
+      const [, kind, name] = m
+      const friendly = kind === 'func' ? `'${name}' is not a known function or built-in`
+        : kind === 'global' ? `'${name}' is not a known global or imported binding`
+        : `'${name}' is not in scope`
+      err(`${friendly} — jz emitted a reference it cannot resolve (likely an unsupported built-in or missing import).`)
+    }
+    throw e
   }
-  return namedWasm
 }
 
 /**
@@ -365,7 +416,8 @@ export default function jz(code, ...args) {
     }
     if (hoisted.length) src = hoisted.join('; ') + '; ' + src
     const hasInterp = Object.keys(interp).length
-    const result = instantiateRuntime(jz.compile, src, { _interp: hasInterp ? interp : null })
+    const tplOpts = { _interp: hasInterp ? interp : null }
+    const result = instantiateRuntime(jz.compile(src, tplOpts), tplOpts)
     // Patch data getters: allocate values in WASM memory, update closure refs
     for (const [, { val, ref }] of Object.entries(data)) {
       if (typeof val === 'string') ref.ptr = result.memory.String(val)
@@ -376,7 +428,8 @@ export default function jz(code, ...args) {
   }
 
   // String call: jz('code', opts?) — compile + instantiate + wrap
-  return instantiateRuntime(jz.compile, code, args[0] || {})
+  const callOpts = args[0] || {}
+  return instantiateRuntime(jz.compile(code, callOpts), callOpts)
 }
 
 export { jz }

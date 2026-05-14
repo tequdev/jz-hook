@@ -1,7 +1,7 @@
 import test from 'tst'
 import { is, ok } from 'tst/assert.js'
 import jz, { compile } from '../index.js'
-import { i64ToF64 } from '../src/host.js'
+import { i64ToF64 } from '../interop/nanbox.js'
 import { run } from './util.js'
 
 test('Regression: Object.assign overwrites existing field from subset schema', () => {
@@ -502,6 +502,36 @@ test('Object.values: runtime dispatch — non-object receiver returns empty', ()
   is(f(42), 0)
 })
 
+test('Object.entries: runtime dispatch — untyped param holding HASH', () => {
+  const { f } = run(`
+    let entries = (h) => Object.entries(h)
+    export let f = (s) => {
+      let e = entries(JSON.parse(s))
+      return e.length == 1 && e[0][0] == "only" && e[0][1] == 7 ? 1 : 0
+    }
+  `)
+  is(f('{"only":7}'), 1)
+})
+
+test('Object.entries: runtime dispatch — untyped param holding OBJECT', () => {
+  const { f } = run(`
+    let sumEntries = (o) => {
+      let e = Object.entries(o)
+      return e.length == 2 && e[0][0] == "a" && e[0][1] == 1 && e[1][0] == "b" && e[1][1] == 2 ? 1 : 0
+    }
+    export let f = () => sumEntries({a: 1, b: 2})
+  `)
+  is(f(), 1)
+})
+
+test('Object.entries: runtime dispatch — non-object receiver returns empty', () => {
+  const { f } = run(`
+    let inner = (h) => Object.entries(h).length
+    export let f = (n) => inner(n + 0)
+  `)
+  is(f(42), 0)
+})
+
 // hasOwnProperty: literal and known-schema fold + runtime dispatch.
 // Without an own emit handler the call falls through to __ext_call and the
 // resulting wasm requires JS host imports, defeating the host:'wasi' target.
@@ -570,6 +600,35 @@ test('hasOwnProperty: dynamic key on known-schema OBJECT', () => {
   `)
   is(f('a'), 1)
   is(f('z'), 0)
+})
+
+test('jzify: Object.hasOwnProperty.call canonicalizes to instance hasOwnProperty', () => {
+  const { f } = jz(`
+    export let f = (k) => {
+      const x = {a: 1, b: 2}
+      return Object.hasOwnProperty.call(x, k) ? 1 : 0
+    }
+  `, { jzify: true }).exports
+  is(f('a'), 1)
+  is(f('z'), 0)
+})
+
+test('jzify: empty Object constructor guard canonicalizes to Object.keys check', () => {
+  const { f } = jz(`
+    export let f = (s) => {
+      const configuration = JSON.parse(s)
+      return configuration.constructor === Object && Object.keys(configuration).length === 0 ? 1 : 0
+    }
+  `, { jzify: true }).exports
+  is(f('{}'), 1)
+  is(f('{"a":1}'), 0)
+})
+
+test('jzify: map(String) canonicalizes to inline String callback', () => {
+  const { f } = jz(`
+    export let f = () => [1, 2].map(String).join(",")
+  `, { jzify: true }).exports
+  is(f(), '1,2')
 })
 
 // Regression: compound assignments on array targets crashed with
