@@ -140,8 +140,6 @@ declare module 'hook' {
   export function util_accid(outBuf: WriteBuf, raddr: string): I64
   export function util_raddr(outBuf: WriteBuf, accidBuf: ReadBuf): I64
   export function util_verify(sigBuf: ReadBuf, dataBuf: ReadBuf, pubkeyBuf: ReadBuf): I64
-  export function util_encode(outBuf: WriteBuf, inBuf: ReadBuf, type: I32): I64
-  export function util_decode(outBuf: WriteBuf, inBuf: ReadBuf, type: I32): I64
 
   // ---------------------------------------------------------------------------
   // XFL (Xahau Floating-point Library)
@@ -157,9 +155,6 @@ declare module 'hook' {
   export function float_compare(a: I64, b: I64, mode: 'EQ' | 'NE' | 'LT' | 'GT' | 'LE' | 'GE'): I64
   export function float_mantissa(a: I64): I64
   export function float_sign(a: I64): I64
-  export function float_exponent(a: I64): I64
-  export function float_exponent_set(a: I64, exponent: I32): I64
-  export function float_mantissa_set(a: I64, mantissa: I64): I64
   export function float_int(a: I64, decimalPlaces?: I32, absolute?: I32): I64
   export function float_log(f: I64): I64
   export function float_root(f: I64, n: I32): I64

@@ -15,10 +15,9 @@ import {
   emit, etxn_reserve, etxn_details, etxn_burden, etxn_nonce, etxn_fee_base,
   sto_subfield, sto_subarray, sto_validate, sto_emplace, sto_erase,
   trace, trace_num, trace_float,
-  util_keylet, util_sha512h, util_accid, util_raddr, util_verify, util_encode, util_decode,
+  util_keylet, util_sha512h, util_accid, util_raddr, util_verify,
   float_set, float_multiply, float_divide, float_one, float_compare, float_sum,
-  float_negate, float_mantissa, float_sign, float_int, float_exponent,
-  float_exponent_set, float_mantissa_set, float_log, float_root,
+  float_negate, float_mantissa, float_sign, float_int, float_log, float_root,
   ledger_last_time, ledger_seq, ledger_last_hash, ledger_nonce, ledger_keylet
 } from 'hook'
 export let hook = () => 1

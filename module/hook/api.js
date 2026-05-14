@@ -107,8 +107,6 @@ export default (ctx) => {
   ensureHookImport(ctx, 'util_accid', ['i32', 'i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'util_raddr', ['i32', 'i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'util_verify', ['i32', 'i32', 'i32', 'i32', 'i32', 'i32'])
-  ensureHookImport(ctx, 'util_encode', ['i32', 'i32', 'i32', 'i32', 'i32'])
-  ensureHookImport(ctx, 'util_decode', ['i32', 'i32', 'i32', 'i32', 'i32'])
 
   // === XFL floating point ===
   ensureHookImport(ctx, 'float_set', ['i32', 'i64'])
@@ -125,9 +123,6 @@ export default (ctx) => {
   ensureHookImport(ctx, 'float_mantissa', ['i64'])
   ensureHookImport(ctx, 'float_sign', ['i64'])
   ensureHookImport(ctx, 'float_int', ['i64', 'i32', 'i32'])
-  ensureHookImport(ctx, 'float_exponent', ['i64'])
-  ensureHookImport(ctx, 'float_exponent_set', ['i64', 'i32'])
-  ensureHookImport(ctx, 'float_mantissa_set', ['i64', 'i64'])
   ensureHookImport(ctx, 'float_log', ['i64'])
   ensureHookImport(ctx, 'float_root', ['i64', 'i32'])
 
@@ -552,14 +547,6 @@ export default (ctx) => {
   ctx.core.emit['hook.util_verify'] = (sig, data, pubkey) =>
     typed(['call', '$hook_util_verify',
       ...hookBufArgs(sig), ...hookBufArgs(data), ...hookBufArgs(pubkey)], 'i64')
-
-  // util_encode(write_ptr, write_len, read_ptr, read_len, type) → i64
-  ctx.core.emit['hook.util_encode'] = (...args) =>
-    typed(['call', '$hook_util_encode', ...args.slice(0, 5).map(v => e32(v))], 'i64')
-
-  // util_decode(write_ptr, write_len, read_ptr, read_len, type) → i64
-  ctx.core.emit['hook.util_decode'] = (...args) =>
-    typed(['call', '$hook_util_decode', ...args.slice(0, 5).map(v => e32(v))], 'i64')
 
   // emit(out_buf, tx_buf)
   ctx.core.emit['hook.emit'] = (out, tx) =>
