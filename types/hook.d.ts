@@ -40,6 +40,8 @@ declare module 'hook' {
   // ---------------------------------------------------------------------------
 
   export function trace(label: string, data: ReadBuf, ashex?: boolean): I64
+  export function trace_hex(label: string, data: ReadBuf): I64
+  export function trace_utf8(label: string, data: ReadBuf): I64
   export function trace_num(label: string, num: I64): I64
   export function trace_float(label: string, xfl: I64): I64
 

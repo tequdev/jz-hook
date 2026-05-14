@@ -385,6 +385,10 @@ export default (ctx) => {
     typed(['call', '$hook_trace',
       ...hookValArgs(label), ...hookValArgs(data),
       eopt32(ashex, ['i32.const', 0])], 'i64')
+  // trace(label, data, 1)
+  ctx.core.emit('hook.trace_hex') = (label, data) => ctx.core.emit['hook.trace'](label, data, 1)
+  // trace(label, data, 0)
+  ctx.core.emit('hook.trace_utf8') = (label, data) => ctx.core.emit['hook.trace'](label, data, 0)
 
   // trace_num(label, num)
   ctx.core.emit['hook.trace_num'] = (label, num) =>
