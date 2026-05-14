@@ -402,14 +402,21 @@ export default (ctx) => {
   ctx.core.emit['hook.state_set'] = (val, key) =>
     typed(['call', '$hook_state_set', ...hookValArgs(val), ...hookStrArgs(key)], 'i64')
 
-  // otxn_field(sfField) → scratch; otxn_field(buf, sfField) → user buffer
+  // hookNullableCapArgs: undefined → (ptr=0, len=0); otherwise hookCapArgs
+  // Passing (0,0) to Hook API output functions queries field size without writing.
+  const isUndefinedNode = (v) => v?.type === 'Identifier' && v?.name === 'undefined'
+  const hookNullableCapArgs = (v) => isUndefinedNode(v)
+    ? [typed(['i32.const', 0], 'i32'), typed(['i32.const', 0], 'i32')]
+    : hookCapArgs(v)
+
+  // otxn_field(sfField) → scratch; otxn_field(buf, sfField) → user buffer; otxn_field(undefined, sfField) → (0,0)
   ctx.core.emit['hook.otxn_field'] = (arg0, arg1) => {
     if (arg1 == null) {
       return typed(['call', '$hook_otxn_field',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE],
         e32(arg0)], 'i64')
     }
-    return typed(['call', '$hook_otxn_field', ...hookCapArgs(arg0), e32(arg1)], 'i64')
+    return typed(['call', '$hook_otxn_field', ...hookNullableCapArgs(arg0), e32(arg1)], 'i64')
   }
 
   // hook_account() → scratch; hook_account(out_buf) → user buffer
@@ -468,7 +475,7 @@ export default (ctx) => {
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE],
         e32(arg0)], 'i64')
     }
-    return typed(['call', '$hook_slot', ...hookCapArgs(arg0), e32(arg1)], 'i64')
+    return typed(['call', '$hook_slot', ...hookNullableCapArgs(arg0), e32(arg1)], 'i64')
   }
 
   // slot_id(out_buf, slot_no)
@@ -559,7 +566,7 @@ export default (ctx) => {
   // state_foreign(out, key, ns, acc)
   ctx.core.emit['hook.state_foreign'] = (out, key, ns, acc) =>
     typed(['call', '$hook_state_foreign',
-      ...hookCapArgs(out), ...hookStrArgs(key),
+      ...hookNullableCapArgs(out), ...hookStrArgs(key),
       ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
 
   // state_foreign_set(val, key, ns, acc)
