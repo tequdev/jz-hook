@@ -212,6 +212,36 @@ export default (ctx) => {
     ]
   }
 
+  // hookCapArgs(v) → [ptr_ir, cap_ir]
+  // For OUTPUT buffer functions: passes capacity (ptr-4) as write_len so the Hook API
+  // knows how many bytes it may write. For strings ptr-4 = len = max writable size.
+  // For Uint8Array/Buffer ptr-4 = byteCap (distinct from the current byteLen at ptr-8).
+  // Using ptr-8 (hookBufArgs) for output buffers is wrong: a freshly created Uint8Array
+  // has byteLen=0, and a string literal has garbage at ptr-8 which causes out-of-bounds writes.
+  const hookCapArgs = (v) => {
+    const ir = asI64(emit(v))
+    const bits = getI64Bits(ir)
+    if (bits != null) {
+      const rawOffset = Number(bits & 0xFFFFFFFFn)
+      const cap = readDataI32(rawOffset - 4)
+      if (cap != null) {
+        const ptr = rawOffset - (ctx.runtime.staticDataLen || 0)
+        return [typed(['i32.const', ptr], 'i32'), typed(['i32.const', cap], 'i32')]
+      }
+    }
+    if (ir[0] === 'local.get' || ir[0] === 'global.get') {
+      return [
+        typed(['i32.wrap_i64', ir], 'i32'),
+        typed(['i32.load', ['i32.sub', ['i32.wrap_i64', ir], ['i32.const', 4]]], 'i32')
+      ]
+    }
+    const tmp = temp(); ctx.func.locals.set(tmp, 'i64')
+    return [
+      typed(['i32.wrap_i64', typed(['local.tee', `$${tmp}`, ir], 'i64')], 'i32'),
+      typed(['i32.load', ['i32.sub', ['i32.wrap_i64', typed(['local.get', `$${tmp}`], 'i64')], ['i32.const', 4]]], 'i32')
+    ]
+  }
+
   // hookValArgs(v) → [ptr_ir, len_ir]
   // Like hookBufArgs but reads len from ptr-4 for strings (PTR.STRING) and ptr-8 for buffers.
   const hookValArgs = (v) => {
@@ -269,7 +299,7 @@ export default (ctx) => {
       return typed(['call', '$hook_etxn_nonce',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_etxn_nonce', ...hookBufArgs(out)], 'i64')
+    return typed(['call', '$hook_etxn_nonce', ...hookCapArgs(out)], 'i64')
   }
 
   // etxn_fee_base(tx_buf) → i64
@@ -282,7 +312,7 @@ export default (ctx) => {
 
   // otxn_id(out_buf, flags?) → i64
   ctx.core.emit['hook.otxn_id'] = (out, flags) =>
-    typed(['call', '$hook_otxn_id', ...hookBufArgs(out),
+    typed(['call', '$hook_otxn_id', ...hookCapArgs(out),
       eopt32(flags, ['i32.const', 0])], 'i64')
 
   // slot_clear, slot_count, slot_size, slot_float, meta_slot (slot: i32) → i64
@@ -335,7 +365,7 @@ export default (ctx) => {
   // float_sto(out, currency_buf, issuer_buf, xfl, field_code) → i64
   ctx.core.emit['hook.float_sto'] = (out, currency, issuer, xfl, fieldCode) =>
     typed(['call', '$hook_float_sto',
-      ...hookBufArgs(out), ...hookBufArgs(currency), ...hookBufArgs(issuer),
+      ...hookCapArgs(out), ...hookBufArgs(currency), ...hookBufArgs(issuer),
       e64(xfl), e32(fieldCode)], 'i64')
 
   // float_sto_set(sto_buf) → i64
@@ -366,7 +396,7 @@ export default (ctx) => {
 
   // state(out_buf, key) → state(wptr, wlen, kptr, klen)
   ctx.core.emit['hook.state'] = (out, key) =>
-    typed(['call', '$hook_state', ...hookBufArgs(out), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_state', ...hookCapArgs(out), ...hookStrArgs(key)], 'i64')
 
   // state_set(val_buf, key)
   ctx.core.emit['hook.state_set'] = (val, key) =>
@@ -379,7 +409,7 @@ export default (ctx) => {
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE],
         e32(arg0)], 'i64')
     }
-    return typed(['call', '$hook_otxn_field', ...hookBufArgs(arg0), e32(arg1)], 'i64')
+    return typed(['call', '$hook_otxn_field', ...hookCapArgs(arg0), e32(arg1)], 'i64')
   }
 
   // hook_account() → scratch; hook_account(out_buf) → user buffer
@@ -388,7 +418,7 @@ export default (ctx) => {
       return typed(['call', '$hook_hook_account',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_hook_account', ...hookBufArgs(out)], 'i64')
+    return typed(['call', '$hook_hook_account', ...hookCapArgs(out)], 'i64')
   }
 
   // hook_skip(nh: i32, name: i32) → i64
@@ -397,7 +427,7 @@ export default (ctx) => {
 
   // hook_param(out_buf, key) → i64
   ctx.core.emit['hook.hook_param'] = (out, key) =>
-    typed(['call', '$hook_hook_param', ...hookBufArgs(out), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_hook_param', ...hookCapArgs(out), ...hookStrArgs(key)], 'i64')
 
   // hook_param_set(val, key, hook_hash) → i64
   ctx.core.emit['hook.hook_param_set'] = (val, key, hookHash) =>
@@ -406,7 +436,7 @@ export default (ctx) => {
 
   // otxn_param(out_buf, key) → i64
   ctx.core.emit['hook.otxn_param'] = (out, key) =>
-    typed(['call', '$hook_otxn_param', ...hookBufArgs(out), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_otxn_param', ...hookCapArgs(out), ...hookStrArgs(key)], 'i64')
 
   // ledger_last_hash() → scratch; ledger_last_hash(out_buf) → user buffer
   ctx.core.emit['hook.ledger_last_hash'] = (out) => {
@@ -414,7 +444,7 @@ export default (ctx) => {
       return typed(['call', '$hook_ledger_last_hash',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_ledger_last_hash', ...hookBufArgs(out)], 'i64')
+    return typed(['call', '$hook_ledger_last_hash', ...hookCapArgs(out)], 'i64')
   }
 
   // ledger_nonce() → scratch; ledger_nonce(out_buf) → user buffer
@@ -423,7 +453,7 @@ export default (ctx) => {
       return typed(['call', '$hook_ledger_nonce',
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
-    return typed(['call', '$hook_ledger_nonce', ...hookBufArgs(out)], 'i64')
+    return typed(['call', '$hook_ledger_nonce', ...hookCapArgs(out)], 'i64')
   }
 
   // ledger_keylet(write_ptr, write_len, keylet_type, read_ptr, read_len, read2_ptr, read2_len) → i64
@@ -438,12 +468,12 @@ export default (ctx) => {
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE],
         e32(arg0)], 'i64')
     }
-    return typed(['call', '$hook_slot', ...hookBufArgs(arg0), e32(arg1)], 'i64')
+    return typed(['call', '$hook_slot', ...hookCapArgs(arg0), e32(arg1)], 'i64')
   }
 
   // slot_id(out_buf, slot_no)
   ctx.core.emit['hook.slot_id'] = (out, slotNo) =>
-    typed(['call', '$hook_slot_id', ...hookBufArgs(out), e32(slotNo)], 'i64')
+    typed(['call', '$hook_slot_id', ...hookCapArgs(out), e32(slotNo)], 'i64')
 
   // slot_set(buf, slot_no)
   ctx.core.emit['hook.slot_set'] = (buf, slotNo) =>
@@ -465,7 +495,7 @@ export default (ctx) => {
   // util_keylet(out, type, a, b, c, d, e, f)
   ctx.core.emit['hook.util_keylet'] = (out, type, a, b, c, d, ef, ff) =>
     typed(['call', '$hook_util_keylet',
-      ...hookBufArgs(out), e32(type),
+      ...hookCapArgs(out), e32(type),
       eopt32(a, ['i32.const', 0]), eopt32(b, ['i32.const', 0]),
       eopt32(c, ['i32.const', 0]), eopt32(d, ['i32.const', 0]),
       eopt32(ef, ['i32.const', 0]), eopt32(ff, ['i32.const', 0])], 'i64')
@@ -473,17 +503,17 @@ export default (ctx) => {
   // util_sha512h(out, input)
   ctx.core.emit['hook.util_sha512h'] = (out, input) =>
     typed(['call', '$hook_util_sha512h',
-      ...hookBufArgs(out), ...hookBufArgs(input)], 'i64')
+      ...hookCapArgs(out), ...hookBufArgs(input)], 'i64')
 
   // util_accid(out, raddr_str)
   ctx.core.emit['hook.util_accid'] = (out, raddr) =>
     typed(['call', '$hook_util_accid',
-      ...hookBufArgs(out), ...hookStrArgs(raddr)], 'i64')
+      ...hookCapArgs(out), ...hookStrArgs(raddr)], 'i64')
 
   // util_raddr(out, accid_buf)
   ctx.core.emit['hook.util_raddr'] = (out, accid) =>
     typed(['call', '$hook_util_raddr',
-      ...hookBufArgs(out), ...hookBufArgs(accid)], 'i64')
+      ...hookCapArgs(out), ...hookBufArgs(accid)], 'i64')
 
   // util_verify(sig, data, pubkey)
   ctx.core.emit['hook.util_verify'] = (sig, data, pubkey) =>
@@ -500,11 +530,11 @@ export default (ctx) => {
 
   // emit(out_buf, tx_buf)
   ctx.core.emit['hook.emit'] = (out, tx) =>
-    typed(['call', '$hook_emit', ...hookBufArgs(out), ...hookBufArgs(tx)], 'i64')
+    typed(['call', '$hook_emit', ...hookCapArgs(out), ...hookBufArgs(tx)], 'i64')
 
   // etxn_details(out_buf)
   ctx.core.emit['hook.etxn_details'] = (out) =>
-    typed(['call', '$hook_etxn_details', ...hookBufArgs(out)], 'i64')
+    typed(['call', '$hook_etxn_details', ...hookCapArgs(out)], 'i64')
 
   // sto_subfield(buf, field_id)
   ctx.core.emit['hook.sto_subfield'] = (buf, fid) =>
@@ -529,7 +559,7 @@ export default (ctx) => {
   // state_foreign(out, key, ns, acc)
   ctx.core.emit['hook.state_foreign'] = (out, key, ns, acc) =>
     typed(['call', '$hook_state_foreign',
-      ...hookBufArgs(out), ...hookStrArgs(key),
+      ...hookCapArgs(out), ...hookStrArgs(key),
       ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
 
   // state_foreign_set(val, key, ns, acc)
