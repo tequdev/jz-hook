@@ -340,3 +340,64 @@ test('hook/e2e: state_set(string, string) passes correct val len to state_set', 
   ok(capturedValLen != null, 'state_set() should have been called')
   equal(capturedValLen, 8, `expected val len=8 for "DEADBEEF", got ${capturedValLen}`)
 })
+
+// ---------------------------------------------------------------------------
+// trace_hex / trace_utf8: helpers delegate to trace, not a separate import
+// ---------------------------------------------------------------------------
+test('hook/e2e: trace_hex(label, data) calls trace with as_hex=1', async () => {
+  let capturedAsHex = null
+  const instance = await hookInstance(
+    `import { trace_hex } from 'hook'; export let hook = () => { trace_hex('lbl', 'data'); return "ok" }`,
+    {
+      trace: (lPtr, lLen, dPtr, dLen, asHex) => {
+        capturedAsHex = asHex
+        return 0n
+      },
+    }
+  )
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  ok(capturedAsHex != null, 'trace() should have been called (not a separate trace_hex import)')
+  equal(capturedAsHex, 1, `expected as_hex=1 for trace_hex, got ${capturedAsHex}`)
+})
+
+test('hook/e2e: trace_utf8(label, data) calls trace with as_hex=0', async () => {
+  let capturedAsHex = null
+  const instance = await hookInstance(
+    `import { trace_utf8 } from 'hook'; export let hook = () => { trace_utf8('lbl', 'data'); return "ok" }`,
+    {
+      trace: (lPtr, lLen, dPtr, dLen, asHex) => {
+        capturedAsHex = asHex
+        return 0n
+      },
+    }
+  )
+  try {
+    instance.exports.hook(0)
+  } catch (e) {
+    if (e.type !== 'accept') throw e
+  }
+  ok(capturedAsHex != null, 'trace() should have been called (not a separate trace_utf8 import)')
+  equal(capturedAsHex, 0, `expected as_hex=0 for trace_utf8, got ${capturedAsHex}`)
+})
+
+test('hook/e2e: trace_hex WAT has no trace_hex import — only trace', () => {
+  const wat = compile(
+    `import { trace_hex } from 'hook'; export let hook = () => { trace_hex('lbl', 'data'); return "ok" }`,
+    { host: 'hook', wat: true, jzify: true }
+  )
+  ok(!wat.includes('"trace_hex"'), `expected no trace_hex import in WAT, got:\n${wat}`)
+  ok(wat.includes('"trace"'), `expected trace import in WAT, got:\n${wat}`)
+})
+
+test('hook/e2e: trace_utf8 WAT has no trace_utf8 import — only trace', () => {
+  const wat = compile(
+    `import { trace_utf8 } from 'hook'; export let hook = () => { trace_utf8('lbl', 'data'); return "ok" }`,
+    { host: 'hook', wat: true, jzify: true }
+  )
+  ok(!wat.includes('"trace_utf8"'), `expected no trace_utf8 import in WAT, got:\n${wat}`)
+  ok(wat.includes('"trace"'), `expected trace import in WAT, got:\n${wat}`)
+})
