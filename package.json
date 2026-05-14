@@ -23,7 +23,8 @@
     "jz-hook": "cli.js"
   },
   "scripts": {
-    "test": "node test/index.js",
+    "test": "npm run test:hook && npm run test:hook-pin && npm run test:hook-snapshots",
+    "test:jz": "node test/index.js",
     "test262": "node test/test262.js",
     "test262:builtins": "node test/test262-builtins.js",
     "test:hook": "node test/hook/index.js",
@@ -32,6 +33,8 @@
     "bench:compile": "node scripts/bench-compile.mjs",
     "test:bench-pin": "node test/bench-pin.js",
     "test:hook-pin": "node test/hook-pin.js",
+    "test:hook-snapshots": "node test/hook/samples-wat.js",
+    "test:hook-snapshots:update": "UPDATE_SNAPSHOTS=1 npm run test:hook-snapshots",
     "prepublishOnly": "npm run test:hook && npm run test:hook-pin"
   },
   "repository": {

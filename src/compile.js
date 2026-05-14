@@ -340,13 +340,20 @@ function emitFunc(func, funcFacts, programFacts) {
     const stmts = emitBody(body)
     for (const [l, t] of ctx.func.locals) fn.push(['local', `$${l}`, t])
     if (isHookEntry) {
-      // Fallthrough accept(0, 0, 0) + unreachable after body. Dead code when body ends with
-      // explicit return/throw (already lowered to accept/rollback + unreachable), but provides
-      // accept for hook functions that fall through without an explicit return.
-      fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, ...stmts,
-        ['drop', ['call', '$hook_accept', ['i32.const', 0], ['i32.const', 0], ['i64.const', 0]]],
-        ['unreachable'],
-        ['i64.const', 0])
+      // If the last emitted statement is already terminal (emitHookAccept / throw→rollback both
+      // produce a void-typed block ending with unreachable), skip the redundant fallback.
+      // Otherwise append accept(0,0,0)+unreachable for hook functions that fall through.
+      const lastStmt = stmts.at(-1)
+      const isTerminal = Array.isArray(lastStmt) && lastStmt[0] === 'block' && lastStmt.type === 'void'
+      if (isTerminal) {
+        fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, ...stmts,
+          ['i64.const', 0])
+      } else {
+        fn.push(...defaultInits, ...boxedParamInits, ...preboxedLocalInits, ...stmts,
+          ['drop', ['call', '$hook_accept', ['i32.const', 0], ['i32.const', 0], ['i64.const', 0]]],
+          ['unreachable'],
+          ['i64.const', 0])
+      }
     } else {
       // I: Skip trailing fallback when last statement is return (unreachable code)
       const lastStmt = stmts.at(-1)

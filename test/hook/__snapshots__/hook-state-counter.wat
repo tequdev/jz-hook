@@ -69,14 +69,7 @@
       )
       (unreachable)
     )
-    (drop
-      (call $hook_accept
-        (i32.const 0)
-        (i32.const 0)
-        (i64.const 0)
-      )
-    )
-    (unreachable)
+    (i64.const 0)
   )
   (func $cbak
     (export "cbak")
