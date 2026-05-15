@@ -145,6 +145,59 @@ export default (ctx) => {
             (data.charCodeAt(idx+2)<<16) | (data.charCodeAt(idx+3)<<24)) >>> 0
   }
 
+  // Read a LE i64 from the static data segment as BigInt.
+  const readDataI64 = (idx) => {
+    const data = ctx.runtime.data
+    if (!data || idx < 0 || idx + 8 > data.length) return null
+    const lo = BigInt((data.charCodeAt(idx) | (data.charCodeAt(idx+1)<<8) |
+                       (data.charCodeAt(idx+2)<<16) | (data.charCodeAt(idx+3)<<24)) >>> 0)
+    const hi = BigInt((data.charCodeAt(idx+4) | (data.charCodeAt(idx+5)<<8) |
+                       (data.charCodeAt(idx+6)<<16) | (data.charCodeAt(idx+7)<<24)) >>> 0)
+    return lo | (hi << 32n)
+  }
+
+  // Try to interpret a static PTR.ARRAY as a flat byte buffer.
+  // Number elements are truncated to u8. PTR.STRING elements are parsed as hex (e.g. 'DE' → 0xDE).
+  // Returns [dataSegmentBase, byteCount] on success, null on failure.
+  const tryArrayAsBytes = (rawOffset) => {
+    const len = readDataI32(rawOffset - 8)
+    if (len == null) return null
+    if (len === 0) {
+      if (!ctx.runtime.data) ctx.runtime.data = ''
+      return [ctx.runtime.data.length, 0]
+    }
+    const bytes = []
+    for (let i = 0; i < len; i++) {
+      const elemBits = readDataI64(rawOffset + i * 8)
+      if (elemBits == null) return null
+      if ((elemBits & 0x7FF8000000000000n) === 0x7FF8000000000000n) {
+        // NaN-boxed value: only PTR.STRING hex strings are supported
+        const elemTag = Number((elemBits >> 47n) & 0xFn)
+        if (elemTag !== PTR.STRING) return null
+        const strOffset = Number(elemBits & 0xFFFFFFFFn)
+        const strLen = readDataI32(strOffset - 4)
+        if (strLen == null || strLen < 1 || strLen > 4) return null
+        const data = ctx.runtime.data
+        let str = ''
+        for (let j = 0; j < strLen; j++) str += String.fromCharCode(data.charCodeAt(strOffset + j))
+        const byte = parseInt(str, 16)
+        if (!Number.isFinite(byte) || byte < 0 || byte > 255) return null
+        bytes.push(byte)
+      } else {
+        // Regular f64
+        const buf = new ArrayBuffer(8)
+        new DataView(buf).setBigUint64(0, BigInt.asUintN(64, elemBits))
+        const f64 = new DataView(buf).getFloat64(0)
+        if (!Number.isFinite(f64)) return null
+        bytes.push(Math.trunc(f64) & 0xFF)
+      }
+    }
+    if (!ctx.runtime.data) ctx.runtime.data = ''
+    const base = ctx.runtime.data.length
+    ctx.runtime.data += bytes.map(b => String.fromCharCode(b)).join('')
+    return [base, len]
+  }
+
   // Extract BigInt bits from an i64.const IR node.
   const getI64Bits = (ir) => {
     if (!Array.isArray(ir) || ir[0] !== 'i64.const') return null
@@ -245,6 +298,16 @@ export default (ctx) => {
     if (bits != null) {
       const tag = Number((bits >> BigInt(LAYOUT.TAG_SHIFT)) & BigInt(LAYOUT.TAG_MASK))
       const rawOffset = Number(bits & 0xFFFFFFFFn)
+      // PTR.ARRAY: convert array elements to a flat byte buffer.
+      // Supports number elements (truncated to u8) and PTR.STRING hex elements ('DE' → 0xDE).
+      if (tag === PTR.ARRAY) {
+        const result = tryArrayAsBytes(rawOffset)
+        if (result != null) {
+          const [base, len] = result
+          const ptr = base - (ctx.runtime.staticDataLen || 0)
+          return [typed(['i32.const', ptr], 'i32'), typed(['i32.const', len], 'i32')]
+        }
+      }
       const lenOff = tag === PTR.STRING ? -4 : -8
       const len = readDataI32(rawOffset + lenOff)
       if (len != null) {

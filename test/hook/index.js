@@ -22,6 +22,7 @@ const TESTS = [
   'e2e',
   'idiom-map',
   'array-static',
+  'state-set-bytes',
 ]
 
 const argFilters = process.argv.slice(2)
