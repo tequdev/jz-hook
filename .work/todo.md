@@ -43,7 +43,140 @@
 * [ ] True metacircular bootstrap
 * [ ] swappable watr: AST likely needs stringifying before compile if an adapter is provided
 
-* [ ] Running wasm files without pulling jz dependency for wrapping nan-boxes — alternative way to pass data?
+
+### Boundary protocol and internal representation
+
+Two separable concerns, conflated by the previous "ABI presets" plan:
+
+1. **Boundary protocol** — how host code calls the `.wasm`. This is the only ABI users see.
+2. **Internal representation** — how values live inside the wasm. Analysis-driven, per-site, never user-configured.
+
+The old plan treated both as "ABI" — `opts.abi: 'nanbox' | 'flat' | 'nanbox+jsstring'` covered both knobs at once. That conflation is the root cause of every "which preset should I pick?" smell. The user choosing internal representation is a category error: the compiler has more information about each call site than the user could plausibly enumerate. Exposing the choice freezes the internal layout to whatever the user happened to pick — the opposite of "compile to the most fitting form." A person reading the source infers types from name, literals, operators, member access, control-flow guards. The compiler should do the same, and beat the user at it.
+
+#### User surface — `opts.host`
+
+The only knob the host actually needs is "how do I call this."
+
+```js
+jz.compile(src, { host: 'js' })    // default — JS host; externref strings, ref-typed exports allowed
+jz.compile(src, { host: 'wasi' })  // C-ABI shape; linear-memory strings; no engine builtins
+jz.compile(src, { host: 'gc' })    // wasm-gc; stringref, ref-typed exports
+```
+
+`opts.host` decides:
+- Which `wasm:js-string` imports may be referenced (only `js`).
+- Whether externref / ref-types are valid in export signatures (`js` yes, `wasi` no).
+- Boundary marshalling shape (`interop/<host>.js` driver).
+
+It does **not** decide the internal layout of any value. A program compiled with `host: 'js'` still gets a flat `i32` slot wherever narrowing proves an integer; a `host: 'wasi'` program still gets nanbox-tagged f64 where analysis can't disambiguate.
+
+#### Internal representation — compiler-owned, per-site
+
+`abi/` becomes `src/abi/` — internal codegen modules with no user surface. **One file per type**, holding every carrier the compiler may pick for that type. Carriers are named exports inside; the narrower picks one per site by analysis.
+
+```
+src/abi/number.js  — nanbox-f64 (default), flat-i32, flat-f64
+src/abi/string.js  — sso (default), jsstring (host: 'js' only)
+src/abi/array.js   — tagged-linear (default), typed (Int32/Float64 backing)
+src/abi/object.js  — schema-linear with per-field rep
+```
+
+The earlier `src/abi/<type>/<rep>.js` split would have been preset-thinking smuggled in by file layout — separate files imply separate testing units, which implies user-pickable presets, which is exactly the surface we're removing. One file per type matches the actual factoring: carriers for the same type share domain knowledge (what a "number" means, which ops it supports), so they belong together. Cross-carrier helpers (slot-type coercion, op dispatch) sit next to the carriers without an artificial folder crossing.
+
+Sketch:
+
+```js
+// src/abi/number.js
+export const nanboxF64 = {
+  slotType: 'f64',
+  ops: { add: (a, b, ctx) => …, eq: …, },
+  peephole: (node) => …,
+}
+export const flatI32 = {
+  slotType: 'i32',
+  ops: { add: (a, b, ctx) => ['i32.add', a, b], … },
+}
+export const flatF64 = { slotType: 'f64', ops: { … } }
+
+// default carrier — picked when narrower has no stronger evidence
+export default nanboxF64
+```
+
+Per-site dispatch, not module-wide preset. The narrower walks the IR, tags each binding/expression with a carrier choice, codegen reads `ctx.abi.number[choice].ops.<op>` (or equivalent). A function may carry an `f64`-slot nanbox number, an `i32`-slot count, and an `externref` string in the same body — each chosen because analysis proved it, not because a preset said so.
+
+The slot-carrier contract from the existing refactor stays: each carrier's `ops.<op>` accepts slot-typed IR and emits the call/inline. Carriers are cycle-safe (no `src/*` imports), siblings inside one ~150–300-line type module.
+
+#### Analysis as the engine
+
+Per-site representation is only as good as the inference feeding it. The narrower fixpoint exists; the work is enriching its evidence sources.
+
+Type evidence, ordered by strength:
+
+1. **Literal use** — `let x = 0`, `let s = ''`, `let xs = []`. Direct.
+2. **Operator application** — `x | 0` / `x >>> 0` force i32; `x * 1.0` keeps f64; `s.charCodeAt`, `s + ''` force string.
+3. **Member access pattern** — `.length` on a thing only `+=`'d with strings; `.push` / `[i]=` on a thing only indexed by integers.
+4. **`typeof` guard** — `typeof x === 'number'` narrows on the true branch (partly handled in narrow.js).
+5. **Assignment flow** — `x = y` propagates `y`'s evidence to `x`; SSA edges already in the IR.
+6. **Comparison shape** — `x === null` proves nullable; `x === 0` rules out string.
+7. **JSDoc `@type`** — explicit hint when ambiguous. Authorial intent, not enforced contract.
+8. **Default cast** — anything still ambiguous after the fixpoint stays nanbox-tagged f64. Default is never wrong, only sometimes wider than necessary.
+
+Each step closes one class of dynamic-fallback emit. Representation work only runs once narrowing has decided a type, so better evidence → more sites take the narrow rep. Investing in narrowing compounds with every rep added later.
+
+#### Workstreams, in priority order
+
+* [ ] **Narrowing investigation (primary).** Pick 5 real jz programs whose output is larger than it should be. For each dynamic-fallback site (`__str_concat`, `__dyn_get`, `__add_any`, `__eq_any`, …), trace why narrowing didn't reach it. Categorize: missing operator evidence, missing member-access evidence, conditional flow not threaded, JSDoc unread. Each category becomes a `narrow.js` follow-up. Target: 5–20× size reduction on the survey programs without touching the representation layer.
+
+* [ ] **Per-site flat-number specialization.** Where narrowing proves a binding is integer-only or non-tag-traffic-f64, emit it as a flat slot (`i32` / bare `f64`) and skip box/unbox at every use. The peephole already collapses `i64.reinterpret_f64 (f64.reinterpret_i64 x)` after inlining — this work moves the elision earlier so wasted i64 traffic never lands in the IR. Carriers: `flatI32`, `flatF64` added to `src/abi/number.js`. Dispatch: narrower tags the binding's carrier; emit reads `ctx.abi.number[binding.carrier].ops.<op>`.
+
+* [ ] **Schema-object field packing.** `schema-linear` today gives every field a tagged-f64 slot regardless of evidence. Threading per-field rep through the schema lets `{count: 0, name: ''}` lay out as `(i32, ptr)` instead of `(f64-tag, f64-tag)`. Halves typical struct size; identity and field-order semantics untouched.
+
+* [ ] **Typed-array element rep.** `xs = [1, 2, 3]` where every push/store is integer becomes `Int32Array` backing instead of tagged-linear. Subsumes the manual `Int32Array.of` ergonomic; plain JS source, typed memory output.
+
+* [ ] **Closure-capture narrowing.** Captured variables today widen to nanbox-tagged at the cell, even when the closure body uses them at a single narrow type. Track per-cell evidence the same way bindings do; emit `i32`/`f64` cells where proven.
+
+* [ ] **SSO flow-through.** Short-literal strings (≤4 ASCII) live SSO-encoded already, but concat results widen to heap pointers immediately. Where the result also fits SSO, keep it inline. Saves a heap alloc per intermediate.
+
+* [ ] **JS String Builtins specialization** (under `host: 'js'`). When a string binding's evidence is "only operated on via `wasm:js-string`-mappable ops" (`length`, `charCodeAt`, `concat`, `substring`, `fromCharCode`), the narrower picks the `jsstring` carrier from `src/abi/string.js`. The 9-item compiler-wide checklist (today in `abi/string/jsstring.js`'s docstring; folds into `src/abi/string.js` under the rename) stays the implementation plan: externref-typed locals, slot coercer, boundary wrappers, import channel, literals, mutating-fast-path gating, cross-carrier interop, carrier-aware nullish, host driver. Per-site framing makes it incremental: one proven-engine-string binding flips to externref without dragging the whole module.
+
+#### What ships internally vs externally
+
+|                  | User-visible                       | Compiler-internal                                                |
+| ---------------- | ---------------------------------- | ---------------------------------------------------------------- |
+| Boundary shape   | `opts.host` (`js` / `wasi` / `gc`) | `interop/<host>.js` driver                                       |
+| Number carrier   | —                                  | per-site, in `src/abi/number.js`: `nanboxF64` / `flatI32` / `flatF64` |
+| String carrier   | —                                  | per-site, in `src/abi/string.js`: `sso` / `jsstring` (`host: 'js'` only) |
+| Array carrier    | —                                  | per-site, in `src/abi/array.js`: `taggedLinear` / `typed`        |
+| Object layout    | —                                  | per-field, in `src/abi/object.js`: tagged / flat / packed        |
+| Inference hints  | JSDoc `@type` (advisory)           | narrower fixpoint                                                |
+
+The `jz:abi` custom section, if kept, becomes a **feature-detection version stamp** (e.g. "ref-types required", "string-builtins required") so the host driver knows which engine features to feature-test before instantiate. It does **not** carry preset names — there are no presets to name.
+
+#### What drops from the old plan
+
+- `opts.abi` — gone. Replaced by `opts.host`.
+- `PRESETS` as a user surface — gone. Internal `src/abi/` modules are picked per-site by analysis, not by name. (The `PRESETS` table may survive briefly inside the compiler as a default-bundle until per-site picking is wired; it is not a public API.)
+- `JZ_ABI` env flag in tests — gone. Boundary tested by varying `opts.host`; internal repr is implementation detail (assert size / IR shape, not "preset name").
+- Preset matrix testing — gone. No preset to enumerate. Internal-rep tests are properties: "after narrowing, `x | 0` lowers to an i32 slot."
+- Free-form rep maps — never existed publicly; remains an internal property of the narrower.
+- Mass-routing as a discrete step — folded into the per-site rep work. Each workstream routes its own call sites as it lands.
+
+#### Already landed (foundation; do not undo)
+
+* [x] Slot-carrier contract — `abi/string/nanbox-sso.js` accepts slot-typed IR, emits `i64.reinterpret_f64` inline, no `src/*` imports. (Folds into the `sso` carrier of `src/abi/string.js` under the rename.)
+* [x] Empty-ops scaffold — `abi/string/jsstring.js` declares slot types, imports, and the 9-item compiler-wide checklist for real codegen. (Folds into the `jsstring` carrier of `src/abi/string.js`.)
+* [x] Routed call sites — `module/core.js` (`?.length`), `module/string.js` (`.charCodeAt`), `src/emit.js` (cmp / concat / concatRaw / append-byte) all go through `ctx.abi.string.ops`.
+* [x] Defensive type coercion at `module/core.js:398` fixed the `?.length on string` regression.
+* [x] 1598/1598 tests green at the current internal-rep snapshot.
+* [x] Compiler-side carrier dispatch object on `ctx` (`ctx.abi.<type>.ops.<op>`). The contract stays under the rename; the only change is that `ctx.abi.<type>` resolves to a *carrier* (one of the named exports of `src/abi/<type>.js`), not a separate file.
+* [x] Optimizer-side carrier peephole (`abi/number/nanbox-f64.js#peephole`) — pure-WASM folds in `src/optimize.js`, carrier-specific folds inside the carrier. Stays as-is under the rename (folds into `nanboxF64.peephole` of `src/abi/number.js`).
+
+#### Open policy questions (deferred until first non-default rep emits at scale)
+
+1. **JSDoc strength.** `@type` as a hint (overridable by stronger evidence) or as a contract (refuse to widen)? Hint matches the implicit-inference philosophy; contract gives users an escape hatch for cross-module boundaries. Default: hint.
+2. **Null/undefined under flat slots.** A flat `i32` / `f64` can't carry them. Narrower must prove non-null at the binding or widen back to tagged. No new syntax.
+3. **Compound lifetime.** `__alloc` for a flat string passed to a host call — when freed? Today's `_clear`-reset arena is fine for short-lived; long-running needs a hook. Defer until a real long-running program forces it.
+4. **Cross-module ABI freezing.** Exported flat-slot signatures are part of the module's public contract even though `opts.host` is what users picked. Resolution: export signatures derive from proven types of exports' params/returns. Stable signature ⇒ write the export so its types are obvious (or annotate). The compiler does not promise stable internal rep across versions for the same source.
 
 ### REPL
 

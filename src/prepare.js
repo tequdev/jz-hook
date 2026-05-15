@@ -24,7 +24,8 @@
 
 import { parse } from 'subscript/feature/jessie'
 import { ctx, err, derive } from './ctx.js'
-import { T, STMT_OPS, VAL, valTypeOf, typedElemCtor, extractParams, collectParamNames, classifyParam, observeNodeFacts, staticPropertyKey } from './analyze.js'
+import { T, STMT_OPS, VAL, extractParams, collectParamNames, classifyParam, observeNodeFacts, staticPropertyKey } from './analyze.js'
+import { recordGlobalRep } from './infer.js'
 import { isFuncRef } from './ir.js'
 import { fuseSparseMapReads } from './fuse.js'
 import {
@@ -117,17 +118,6 @@ function resolveImportMeta(spec) {
   const base = importMetaUrl()
   try { return new URL(spec, base).href }
   catch { err(`Cannot resolve import.meta specifier '${spec}' from '${base}'`) }
-}
-
-function recordGlobalValueFact(name, expr) {
-  if (typeof name !== 'string') return
-  const vt = valTypeOf(expr)
-  if (vt) {
-    ;(ctx.scope.globalValTypes ||= new Map()).set(name, vt)
-    if (vt === VAL.REGEX && ctx.runtime.regex) ctx.runtime.regex.vars.set(name, expr)
-  }
-  const ctor = typedElemCtor(expr)
-  if (ctor) (ctx.scope.globalTypedElem ||= new Map()).set(name, ctor)
 }
 
 function recordModuleInitFacts(root) {
@@ -251,7 +241,7 @@ export default function prepare(node) {
 
   // Invalidate shapeStrs for any module-level binding that's later assigned to.
   // shapeStrs is "effectively-const string literals at module scope" — used by
-  // analyze.js's jsonConstString to enable shape inference on `let SRC = '{...}'`
+  // shape.js's jsonConstString to enable shape inference on `let SRC = '{...}'`
   // patterns (bench convention) without enabling the const-only static fold.
   // The scan must skip `=` nodes that are children of `let`/`const`/`export` —
   // those are decl-initializers, not reassignments.
@@ -627,7 +617,7 @@ function prepDecl(op, ...inits) {
         // entry whose name is later assigned to.
         if (Array.isArray(normed) && normed[0] === 'str' && typeof normed[1] === 'string')
           (ctx.scope.shapeStrs ||= new Map()).set(declName, normed[1])
-        recordGlobalValueFact(declName, normed)
+        recordGlobalRep(declName, normed)
       }
       // Track object schemas (after prefix so schema is keyed to final name)
       if (typeof declName === 'string' && Array.isArray(normed) && normed[0] === '{}' && normed.length > 1) {
@@ -673,7 +663,18 @@ const handlers = {
   'class': () => err('class not supported: use object literals'),
   'yield': () => err('generators not supported: use loops'),
   'debugger': () => null,
-  'delete': () => err('delete not supported: object shape is fixed'),
+  // Static-key delete (.x, ["x"], [literal]) would change the fixed schema → reject.
+  // Computed-key delete (obj[expr]) — including jessie's `delete ctx[k]` — lowers
+  // to runtime __dyn_del against the per-object shadow property store.
+  'delete'(target) {
+    const t = prep(target)
+    if (Array.isArray(t) && t[0] === '[]' && t.length === 3) {
+      const key = t[2]
+      const isLiteralKey = Array.isArray(key) && key[0] == null && key.length === 2
+      if (!isLiteralKey) return ['delete', t[1], key]
+    }
+    err('delete not supported: object shape is fixed')
+  },
   'in'(key, obj) { return ['in', prep(key), prep(obj)] },
   'instanceof': () => err('instanceof not supported: use typeof'),
   'with': () => err('`with` not supported: deprecated'),
@@ -1116,6 +1117,10 @@ const handlers = {
 
     if (typeof callee === 'string') {
       if (PROHIBITED[callee]) err(PROHIBITED[callee])
+      if (callee === 'Array') {
+        const callArgs = flatArgs(args).filter(a => a != null)
+        if (callArgs.length === 1) return handlers['new'](['()', callee, callArgs[0]])
+      }
       if (CTORS.includes(callee)) return handlers['new'](['()', callee, ...args])
 
       if (includeForNamedCall(callee)) {
@@ -1372,6 +1377,7 @@ const handlers = {
 
   // Property access - resolve namespaces or object/array properties
   '.'(obj, prop) {
+    prop = typeof prop === 'string' ? prop : staticPropertyKey(prop)
     if (prop === 'caller' || prop === 'callee') err('`.caller` and `.callee` are prohibited: deprecated stack introspection')
     if (prop === 'url' && isImportMeta(obj)) return staticString(importMetaUrl())
     const mod = ctx.scope.chain[obj]
@@ -1600,7 +1606,7 @@ function prepareModule(specifier, source) {
     const mangled = `${prefix}$${localName}`
     moduleExports.set(exportName, mangled)
     const func = ctx.func.list.find(f => f.name === localName)
-    if (func) renameFunc(func, mangled)
+    if (func) { renameFunc(func, mangled); func._modulePrefix = prefix }
     if (ctx.scope.globals.has(localName)) {
       const wat = ctx.scope.globals.get(localName).replace(`$${localName}`, `$${mangled}`)
       ctx.scope.globals.delete(localName)
@@ -1662,15 +1668,17 @@ function prepareModule(specifier, source) {
   }
 
   // Rename ALL non-exported functions created during this module's prep
-  // (fn property assignments like f32.parse, internal helpers like cleanInt)
+  // (fn property assignments like f32.parse, internal helpers like cleanInt).
+  // Funcs added by nested prepareModule calls are tagged with `_modulePrefix`
+  // by their own pass; skip those so prefixes don't stack (`a$b$name`).
   for (let i = savedFuncCount; i < ctx.func.list.length; i++) {
     const func = ctx.func.list[i]
     if (func.raw || func.name.startsWith(prefix + '$')) continue
-    // Skip functions from sub-imports (already prefixed with another module's prefix)
-    if (func.name.includes('__') && func.name.includes('$')) continue
+    if (func._modulePrefix && func._modulePrefix !== prefix) continue
     const mangled = `${prefix}$${func.name}`
     moduleExports.set(func.name, mangled)
     renameFunc(func, mangled)
+    func._modulePrefix = prefix
   }
 
   // Add mangled non-exported globals to moduleExports for walk renaming
@@ -1702,6 +1710,8 @@ function prepareModule(specifier, source) {
     for (let i = savedFuncCount; i < ctx.func.list.length; i++) {
       const func = ctx.func.list[i]
       if (!func.body) continue
+      // Sub-module funcs already had their own walk; parent's rename map doesn't apply.
+      if (func._modulePrefix && func._modulePrefix !== prefix) continue
       const funcParams = new Set(func.sig?.params?.map(p => p.name) || [])
       walk(func.body, funcParams)
       if (func.defaults) for (const [k, v] of Object.entries(func.defaults)) func.defaults[k] = walk(v, funcParams)

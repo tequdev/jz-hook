@@ -8,7 +8,7 @@ import { UNDEF_NAN, NULL_NAN } from '../interop/nanbox.js'
 import prepare, { GLOBALS } from '../src/prepare.js'
 import { ctx, reset } from '../src/ctx.js'
 import { emitter } from '../src/emit.js'
-import { analyzeValTypes, analyzeIntCertain, analyzeLocals, repOf, updateRep, VAL } from '../src/analyze.js'
+import { analyzeValTypes, analyzeIntCertain, analyzeBody, repOf, updateRep, VAL } from '../src/analyze.js'
 
 const coerce = v => v === undefined ? UNDEF_NAN : v === null ? NULL_NAN : v
 
@@ -186,6 +186,10 @@ test('constant: NaN', () => {
   ok(isNaN(run('export let f = () => NaN').f()))
 })
 
+test('constant: Number.NaN', () => {
+  ok(isNaN(run('export let f = () => Number.NaN').f()))
+})
+
 test('constant: Infinity', () => {
   is(run('export let f = () => Infinity').f(), Infinity)
 })
@@ -350,6 +354,24 @@ test('switch: jzify strips terminal breaks inside braced cases', () => {
   }`, { jzify: true })
   is(f(1), 10)
   is(f(2), 30)
+})
+
+test('switch: jzify lowers nested case breaks', () => {
+  const { f } = run(`export let f = (x) => {
+    let y = 0
+    switch (x) {
+      case 1:
+        if (y === 0) {
+          break
+        }
+        y = 10
+      default:
+        y = 20
+    }
+    return y
+  }`, { jzify: true })
+  is(f(1), 0)
+  is(f(2), 20)
 })
 
 // === Default params ===
@@ -622,7 +644,7 @@ test('typed-narrow: escape via store does not break narrowed helper', () => {
 })
 
 test('typed-narrow: receiver unbox after .map on TYPED', () => {
-  // analyzePtrUnboxable.isFreshInit accepts `arr.map(fn)` shape when arr is in
+  // unboxablePtrs.isFreshInit accepts `arr.map(fn)` shape when arr is in
   // ctx.types.typedElem (locally TYPED with known elem ctor).
   const { f } = runHost(`
     let mk = () => new Float64Array([1.5, 2.5, 3.5])
@@ -700,7 +722,7 @@ function runAnalyze(code, paramVals) {
   const fn = ctx.func.list.find(f => !f.raw && !f.exported && f.body && Array.isArray(f.body))
     || ctx.func.list[0]
   const body = fn.body
-  ctx.func.locals = analyzeLocals(body)
+  ctx.func.locals = analyzeBody(body).locals
   if (paramVals) for (const [n, v] of Object.entries(paramVals)) updateRep(n, { val: v })
   analyzeValTypes(body)
   analyzeIntCertain(body)

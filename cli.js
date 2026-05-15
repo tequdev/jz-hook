@@ -45,6 +45,8 @@ Options:
   -O<n>, --optimize <n>     Optimization level: 0 off, 1 size-only, 2 default,
                             3 aggressive. Aliases: -Os/size, -Ob/balanced, -Of/speed.
   --host <js|wasi|hook>     Target host environment (default hook)
+  --abi <preset>            ABI preset (default 'nanbox'). Recorded in the wasm
+                            as a 'jz:abi' custom section so jz/interop sniffs it.
   --no-alloc                Omit _alloc/_clear allocator exports (standalone wasm)
   --names                   Emit wasm name section for profilers/debuggers
   --strict                  Strict jz mode (no auto-transform), reject dynamic fallbacks
@@ -133,7 +135,7 @@ function parseOptimize(v) {
 
 async function handleCompile(args) {
   let inputFile = null, outputFile = null, wat = false, strict = false, resolveNode = false, importsFile = null
-  let optimize, host = 'hook', alloc = true, names = false
+  let optimize, host = 'hook', alloc = true, names = false, abi
   let hookOn = null, namespace = null, maxIter = null, validate = false, hookapiVersion = null
 
   for (let i = 0; i < args.length; i++) {
@@ -146,6 +148,8 @@ async function handleCompile(args) {
     else if (a === '--optimize' || a === '-O') optimize = parseOptimize(args[++i])
     else if (/^-O.+/.test(a)) optimize = parseOptimize(a.slice(2))
     else if (a === '--host') host = args[++i]
+    else if (a === '--abi') abi = args[++i]
+    else if (a.startsWith('--abi=')) abi = a.slice('--abi='.length)
     else if (a === '--no-alloc') alloc = false
     else if (a === '--names') names = true
     else if (a === '--hook-on') hookOn = args[++i]
@@ -162,61 +166,70 @@ async function handleCompile(args) {
 
   const code = readFileSync(inputFile, 'utf8')
 
-  // Resolve imports
+  // Resolve imports — canonicalize every specifier to an absolute path so the
+  // same physical file always produces one module instance. Two relative
+  // specifiers from different importers (e.g. `'../../parse.js'` from a feature
+  // module and `'./parse.js'` from the entry) would otherwise hit prepare.js
+  // as separate modules with separate exports / mangling prefixes — and any
+  // module-level state (like a shared `lookup` registry) would split in two.
   const dir = dirname(resolve(inputFile))
-  const modules = {}
+  const modules = {}              // keyed by canonical absolute path
+  const seenPaths = new Set()
+  const pkgImports = {}           // pkg.imports spec → absolute path
 
   const pkgFile = join(dir, 'package.json')
   if (existsSync(pkgFile)) {
     try {
       const pkg = JSON.parse(readFileSync(pkgFile, 'utf8'))
       if (pkg.imports) for (const [spec, path] of Object.entries(pkg.imports)) {
-        const full = resolve(dir, path)
-        try { modules[spec] = readFileSync(full, 'utf8') } catch {}
+        pkgImports[spec] = resolve(dir, path)
       }
     } catch {}
   }
 
-  // Recursively resolve relative imports from entry file and all discovered modules.
-  // Supports both `import x from 'spec'` and bare side-effect `import 'spec'`.
-  // `import` must be anchored to start-of-line (statement position) so that
-  // mentions inside block/line comments and string literals are ignored.
-  const importRe = /^\s*import\s+(?:[^'"]+?\s+from\s+)?['"]([^'"]+)['"]/gm
+  // Matches both `import` and `export ... from` statements (statement position).
+  // Lazy `[^'"]*?` consumes whatever sits between the keyword and the first quote.
+  const importRe = /^\s*(?:import|export)\s+[^'"]*?['"]([^'"]+)['"]/gm
   const resolveBareModule = (specifier, fromDir) => execFileSync(
     process.execPath,
     ['--input-type=module', '-e', 'process.stdout.write(import.meta.resolve(process.argv[1]))', specifier],
     { cwd: fromDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
   ).trim()
-  const resolveModule = (specifier, fromDir) => {
-    if (modules[specifier]) return
-    // Relative imports: resolve from filesystem
+  const resolveAbsPath = (specifier, fromDir) => {
+    if (pkgImports[specifier]) return pkgImports[specifier]
     if (specifier.startsWith('./') || specifier.startsWith('../')) {
       const full = resolve(fromDir, specifier)
-      let src
-      try { src = readFileSync(full, 'utf8') }
-      catch { try { src = readFileSync(full + '.js', 'utf8') } catch { return } }
-      modules[specifier] = src
-      let m; importRe.lastIndex = 0
-      while ((m = importRe.exec(src)) !== null) resolveModule(m[1], dirname(full))
-      return
+      if (existsSync(full)) return full
+      if (existsSync(full + '.js')) return full + '.js'
+      return null
     }
-    // Bare specifiers: opt-in Node.js resolution
     if (resolveNode) {
       try {
         const resolved = resolveBareModule(specifier, fromDir)
-        if (resolved.startsWith('file:')) {
-          const full = new URL(resolved)
-          const src = readFileSync(full, 'utf8')
-          modules[specifier] = src
-          // Recursively resolve the bare-resolved module's own imports
-          let m; importRe.lastIndex = 0
-          while ((m = importRe.exec(src)) !== null) resolveModule(m[1], dirname(full.pathname))
-        }
+        if (resolved.startsWith('file:')) return new URL(resolved).pathname
       } catch {}
     }
+    return null
+  }
+  const rewriteImports = (src, fromDir) => src.replace(importRe, (match, spec) => {
+    const abs = resolveAbsPath(spec, fromDir)
+    if (!abs) return match
+    const q = match[match.lastIndexOf(spec) - 1]
+    return match.slice(0, match.lastIndexOf(spec) - 1) + q + abs + q
+  })
+  const resolveModule = (specifier, fromDir) => {
+    const abs = resolveAbsPath(specifier, fromDir)
+    if (!abs || seenPaths.has(abs)) return
+    seenPaths.add(abs)
+    let src; try { src = readFileSync(abs, 'utf8') } catch { return }
+    modules[abs] = rewriteImports(src, dirname(abs))
+    let m; importRe.lastIndex = 0
+    while ((m = importRe.exec(src)) !== null) resolveModule(m[1], dirname(abs))
   }
   let m; importRe.lastIndex = 0
   while ((m = importRe.exec(code)) !== null) resolveModule(m[1], dir)
+  // Rewrite the entry too so its imports use the same canonical keys.
+  const codeRewritten = rewriteImports(code, dir)
   if (process.env.JZ_DEBUG_MODULES === '1') console.error('modules:', Object.keys(modules))
 
   // .jz = strict (no auto-transform), .js = auto-jzify
@@ -228,6 +241,7 @@ async function handleCompile(args) {
     importMetaUrl: pathToFileURL(resolve(inputFile)).href,
     ...(optimize !== undefined && { optimize }),
     ...(host && { host }),
+    ...(abi && { abi }),
     ...(alloc === false && { alloc: false }),
     ...(names && { profileNames: true }),
     ...(Object.keys(modules).length && { modules }),
@@ -243,7 +257,7 @@ async function handleCompile(args) {
   if (maxIter !== null) opts.maxIter = maxIter
   if (validate) opts.validate = true
 
-  const result = compile(code, opts)
+  const result = compile(codeRewritten, opts)
 
   if (outputFile === '-') {
     process.stdout.write(result)

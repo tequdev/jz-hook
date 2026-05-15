@@ -3,7 +3,7 @@
  *
  * # Stage contract
  *   IN:  prepared AST + ctx.func.list (from prepare).
- *   OUT: per-function populated `ctx.func.repByLocal` (val field) + `ctx.func.locals` + `ctx.func.boxed`,
+ *   OUT: per-function populated `ctx.func.localReps` (val field) + `ctx.func.locals` + `ctx.func.boxed`,
  *        module-global `ctx.scope.globalValTypes`, type-analysis `ctx.types.typedElem` /
  *        `.dynKeyVars` / `.anyDynKey`.
  *
@@ -13,18 +13,17 @@
  *   - analyzeBody:         single unified walk — body-keyed cache, returns
  *                          { locals, valTypes, arrElemSchemas, arrElemValTypes, typedElems }
  *   - analyzeValTypes:     ctx-mutating pass — writes types + tracks regex/typed + localProps
- *   - analyzeLocals:       thin clone-and-extend facade over analyzeBody().locals
- *   - analyzeDynKeys:      cross-function scan for `obj[runtimeKey]` → sets ctx.types.dynKeyVars
- *   - analyzeBoxedCaptures:detect mutably-captured vars → ctx.func.boxed cells
+ *   - boxedCaptures:       detect mutably-captured vars → ctx.func.boxed cells
  *   - extractParams/classifyParam/collectParamNames: arrow param AST normalization helpers
  *
- * Ordering: analyzeDynKeys runs once per compile; others run per function during compile().
+ * Ordering: all passes run per function during compile(). plan.js owns the
+ * cross-function dynKey scan via programFacts (results land in ctx.types.dynKeyVars).
  *
  * @module analyze
  */
 
 import { ctx, err } from './ctx.js'
-import { isLiteralStr, isFuncRef } from './ir.js'
+import { isLiteralStr, isFuncRef, I32_MIN, I32_MAX, isI32 } from './ir.js'
 
 export const T = '\uE000'
 
@@ -48,7 +47,7 @@ export function intLiteralValue(expr) {
   else if (Array.isArray(expr) && expr[0] == null && typeof expr[1] === 'number') v = expr[1]
   else if (Array.isArray(expr) && expr[0] === 'u-' && typeof expr[1] === 'number') v = -expr[1]
   else if (typeof expr === 'string') v = repOf(expr)?.intConst ?? ctx.scope.constInts?.get(expr) ?? null
-  return v != null && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647 ? v : null
+  return v != null && Number.isInteger(v) && v >= I32_MIN && v <= I32_MAX ? v : null
 }
 
 /** Non-negative integer literal — used for string/typed-array index bounds. */
@@ -57,7 +56,7 @@ export const nonNegIntLiteral = (node) => { const n = intLiteralValue(node); ret
 /** Collect all `return X` expressions (X != null) from a function body, skipping nested arrow funcs.
  *  Pushes into `out`. Non-returning paths are silently skipped — pair with `alwaysReturns` if total
  *  coverage matters, or with `hasBareReturn` to detect `return;` (undef result). */
-export const collectReturnExprs = (node, out) => {
+const collectReturnExprs = (node, out) => {
   if (!Array.isArray(node)) return
   const [op, ...args] = node
   if (op === '=>') return
@@ -113,7 +112,7 @@ export const VAL = {
  * ValueRep — unified per-local + per-param representation record. (S2.)
  *
  * One shape, two storages:
- *   - per-local (current func):  ctx.func.repByLocal: Map<name, ValueRep>
+ *   - per-local (current func):  ctx.func.localReps: Map<name, ValueRep>
  *   - per-param (cross-call):    programFacts.paramReps: Map<funcName, Map<paramIdx, ValueRep>>
  *
  * Lattice per field: undefined = unobserved, null = sticky-poison
@@ -129,7 +128,7 @@ export const VAL = {
  *   schemaId:         i32   — schema binding for known-shape OBJECTs
  *   arrayElemSchema:  i32   — Array<schemaId> element shape
  *   arrayElemValType: VAL.* — Array<VAL.*> element val-kind
- *   jsonShape:        obj   — { vt, props?, elem? } for HASH/ARRAY trees parsed
+ *   jsonShape:        obj   — { val, props?, elem? } for HASH/ARRAY trees parsed
  *                             from a compile-time JSON.parse source. Propagates
  *                             through `.prop` and `[i]` so nested chains stay typed.
  *   typedCtor:        str   — TypedArray ctor name (`Float64Array`, …)
@@ -144,37 +143,33 @@ export const VAL = {
  *                             (or `f64.const N`), letting the WAT optimizer fold guards,
  *                             unroll fixed-bound loops, and treeshake the read entirely.
  *                             Cleared if the param is written inside the body.
+ *   notString:        bool   — write-shape evidence proves the binding isn't a primitive
+ *                             string. Gates STRING-vs-typed dispatch elision at `.length`
+ *                             and `xs[i]` reads. Body-walk source: `notStringEvidence` in
+ *                             src/infer.js. Flow-scoped overlay: see `lookupNotString`.
  *
- * Future (S2 stage 4 follow-ups): boxed, intLikely, nullable.
+ * Out-of-band tracking (not rep fields):
+ *   - boxed captures: `ctx.func.boxed: Map<name, cellName>` — set by boxedCaptures
+ *     for mutably-captured locals. Parallel to rep because the cell-based storage is a
+ *     storage decision, not a value-shape fact.
+ *   - flow-sensitive refinements: `ctx.func.refinements: Map<name, {val?, notString?}>` —
+ *     set by emitBody's post-terminator narrowing for the duration of a syntactic suffix.
  */
 
 // === ParamReps lattice helpers (cross-call fixpoint) ===
 // programFacts.paramReps: Map<funcName, Map<paramIdx, ValueRep>>. Per-field lattice:
 // undefined unobserved, null sticky-poison (cross-site disagreement), value = consensus.
 
-/** Per-call-site fact merge into a param's ValueRep field, with sticky-null poison
- *  on disagreement. undefined→observed (set); same value→stay; conflict→null (sticky).
- *  null is "no consensus" — readers treat it as missing. */
-export const mergeParamFact = (rep, key, observed) => {
-  if (rep[key] === null) return                        // sticky poison
-  if (observed == null) { rep[key] = null; return }    // unknown → poison
-  if (rep[key] === undefined) rep[key] = observed
-  else if (rep[key] !== observed) rep[key] = null
-}
-
-/** Get-or-create per-param rep at (funcName, paramIdx) on a paramReps map. */
-export const ensureParamRep = (paramReps, funcName, k) => {
-  let m = paramReps.get(funcName)
-  if (!m) { m = new Map(); paramReps.set(funcName, m) }
-  let r = m.get(k)
-  if (!r) { r = {}; m.set(k, r) }
-  return r
-}
+// Lattice primitives for `paramReps` (`mergeParamFact`, `ensureParamRep`,
+// `clearStickyNull`) live in src/infer.js with the call-site evidence
+// extractors that produce facts for them. `paramFactsOf` (next) stays
+// here because `narrowReturnArrayElems` below consumes it; moving it would
+// invert the analyze.js↔infer.js import direction.
 
 /** Build `paramName → fact` lookup for a caller's already-narrowed param facts.
  *  Used to flow caller's param info into its callees during the cross-call
  *  fixpoint (transitive propagation). Returns null if caller has no facts. */
-export const callerParamFactMap = (paramReps, callerFunc, key) => {
+export const paramFactsOf = (paramReps, callerFunc, key) => {
   if (!callerFunc) return null
   const m = paramReps.get(callerFunc.name)
   if (!m) return null
@@ -189,22 +184,13 @@ export const callerParamFactMap = (paramReps, callerFunc, key) => {
   return out
 }
 
-/** Reset sticky-null on a single field across all params program-wide.
- *  Used between fixpoint phases when newly-narrowed facts unblock previously-
- *  poisoned observations (e.g. valResult set after first pass). */
-export const clearStickyNull = (paramReps, key) => {
-  for (const m of paramReps.values()) for (const r of m.values()) {
-    if (r[key] === null) r[key] = undefined
-  }
-}
-
 /** Get the rep for a local name, or undefined if not tracked. */
-export const repOf = name => ctx.func.repByLocal?.get(name)
+export const repOf = name => ctx.func.localReps?.get(name)
 
 /** Merge fields into a local's rep. Lazily allocates the map and the rep.
  *  Field set to `undefined` removes that field; empty rep is dropped from the map. */
 export const updateRep = (name, fields) => {
-  const m = ctx.func.repByLocal ||= new Map()
+  const m = ctx.func.localReps ||= new Map()
   const prev = m.get(name) || {}
   const next = { ...prev, ...fields }
   for (const k of Object.keys(next)) if (next[k] === undefined) delete next[k]
@@ -213,11 +199,11 @@ export const updateRep = (name, fields) => {
 }
 
 /** Get the rep for a global name, or undefined if not tracked. */
-export const repOfGlobal = name => ctx.scope.repByGlobal?.get(name)
+export const repOfGlobal = name => ctx.scope.globalReps?.get(name)
 
 /** Merge fields into a global's rep. Lazily allocates the map and the rep. */
 export const updateGlobalRep = (name, fields) => {
-  const m = ctx.scope.repByGlobal ||= new Map()
+  const m = ctx.scope.globalReps ||= new Map()
   const prev = m.get(name)
   m.set(name, prev ? { ...prev, ...fields } : { ...fields })
 }
@@ -227,14 +213,23 @@ export const updateGlobalRep = (name, fields) => {
  *  Refinements are pushed by the 'if' emitter when the condition is a type guard
  *  (typeof x === 't', Array.isArray(x), etc.) and popped after the then-branch.
  *  The overlay (`ctx.func.localValTypesOverlay`) is set by analyzeBody/observeSlots passes
- *  pre-emit, when `repByLocal` isn't populated yet but a local Map<name, VAL.*> is
+ *  pre-emit, when `localReps` isn't populated yet but a local Map<name, VAL.*> is
  *  available — lets `const x = new Float64Array(); const y = x[0]` resolve y as NUMBER. */
 export const lookupValType = name => {
   const r = ctx.func.refinements
-  if (r && r.size) { const v = r.get(name); if (v) return v }
+  if (r && r.size) { const v = r.get(name)?.val; if (v) return v }
   const ov = ctx.func.localValTypesOverlay
   if (ov) { const v = ov.get(name); if (v) return v }
-  return ctx.func.repByLocal?.get(name)?.val || ctx.scope.globalValTypes?.get(name) || null
+  return ctx.func.localReps?.get(name)?.val || ctx.scope.globalValTypes?.get(name) || null
+}
+
+/** Resolve `notString` for a binding, overlaying flow-sensitive refinements
+ *  on top of the function-global rep proof. Mirrors `lookupValType`'s precedence:
+ *  refinement first (scope-local), then rep (whole-function). */
+export const lookupNotString = name => {
+  const r = ctx.func.refinements
+  if (r && r.size && r.get(name)?.notString) return true
+  return ctx.func.localReps?.get(name)?.notString === true
 }
 
 /** Infer value type of an AST expression (without emitting). */
@@ -278,7 +273,7 @@ export function valTypeOf(expr) {
     // Indexed read on a known Array<VAL> receiver: bind by rep.arrayElemValType.
     // Set by analyzeValTypes from body observations + emitFunc preseed for params.
     if (typeof args[0] === 'string') {
-      const elemVt = ctx.func.repByLocal?.get(args[0])?.arrayElemValType
+      const elemVt = ctx.func.localReps?.get(args[0])?.arrayElemValType
       if (elemVt) return elemVt
     }
   }
@@ -296,9 +291,9 @@ export function valTypeOf(expr) {
   // child's val-type. Generic for any compile-time-known JSON literal.
   if (op === '.' && typeof args[1] === 'string') {
     const sh = shapeOf(args[0])
-    if (sh?.vt === VAL.OBJECT || sh?.vt === VAL.HASH) {
+    if (sh?.val === VAL.OBJECT || sh?.val === VAL.HASH) {
       const child = sh.props[args[1]]
-      if (child) return child.vt
+      if (child) return child.val
     }
   }
   // Arithmetic expressions: BigInt if either operand is BigInt, else number
@@ -369,7 +364,7 @@ export function valTypeOf(expr) {
       }
       if (method === 'push') return VAL.ARRAY
       if ((method === 'shift' || method === 'pop') && typeof obj === 'string') {
-        const elemVt = ctx.func.repByLocal?.get(obj)?.arrayElemValType
+        const elemVt = ctx.func.localReps?.get(obj)?.arrayElemValType
         if (elemVt) return elemVt
       }
       if (method === 'add' || method === 'delete') return VAL.SET
@@ -389,128 +384,9 @@ export function valTypeOf(expr) {
   return null
 }
 
-function jsonConstString(expr) {
-  if (Array.isArray(expr) && expr[0] === 'str' && typeof expr[1] === 'string') return expr[1]
-  if (Array.isArray(expr) && expr[0] == null && typeof expr[1] === 'string') return expr[1]
-  if (typeof expr === 'string') {
-    // Prefer shapeStrs (broader: includes effectively-const `let` string literals
-    // at module scope) over constStrs (const-only). Module/json's static-fold
-    // path uses its own constStrs-only resolver to avoid folding `let`-bound
-    // initializers — preserving the user-controlled distinction. Shape
-    // inference is sound either way: an effectively-const literal's value is
-    // invariant, so the parsed shape it produces is too.
-    return ctx.scope.shapeStrs?.get(expr) ?? ctx.scope.constStrs?.get(expr) ?? null
-  }
-  return null
-}
-
-function jsonShapeStrings(expr) {
-  const single = jsonConstString(expr)
-  if (single != null) return [single]
-  if (Array.isArray(expr) && expr[0] === '[]' && typeof expr[1] === 'string') return ctx.scope.shapeStrArrays?.get(expr[1]) ?? null
-  return null
-}
-
-/** Build a structural shape tree from a parsed JSON value. Each node is
- *  `{ vt, props?, elem? }`. Lets `valTypeOf` propagate VAL kinds through
- *  `.prop` chains and `[i]` reads on bindings sourced from `JSON.parse`
- *  of a compile-time-known string. Polymorphic arrays drop their `elem`. */
-function shapeOfJsonValue(v) {
-  if (v === null || v === undefined) return null
-  if (typeof v === 'number') return { vt: VAL.NUMBER }
-  if (typeof v === 'string') return { vt: VAL.STRING }
-  if (typeof v === 'boolean') return { vt: VAL.NUMBER }
-  if (Array.isArray(v)) {
-    let elem = null
-    for (const x of v) {
-      const s = shapeOfJsonValue(x)
-      if (!s) { elem = null; break }
-      if (!elem) elem = s
-      else if (!shapeUnifies(elem, s)) { elem = null; break }
-    }
-    return { vt: VAL.ARRAY, elem }
-  }
-  if (typeof v === 'object') {
-    const props = Object.create(null)
-    const names = Object.keys(v)
-    for (const k of names) {
-      const s = shapeOfJsonValue(v[k])
-      if (s) props[k] = s
-    }
-    return { vt: VAL.OBJECT, props, names }
-  }
-  return null
-}
-
-function shapeUnifies(a, b) {
-  if (!a || !b || a.vt !== b.vt) return false
-  if (a.vt === VAL.OBJECT || a.vt === VAL.HASH) {
-    const ak = Object.keys(a.props), bk = Object.keys(b.props)
-    if (ak.length !== bk.length) return false
-    for (const k of ak) {
-      if (!b.props[k] || !shapeUnifies(a.props[k], b.props[k])) return false
-    }
-  }
-  if (a.vt === VAL.ARRAY) {
-    if ((a.elem == null) !== (b.elem == null)) return false
-    if (a.elem && !shapeUnifies(a.elem, b.elem)) return false
-  }
-  return true
-}
-
-function shapeLayoutUnifies(a, b) {
-  if (!shapeUnifies(a, b)) return false
-  if (a.vt === VAL.OBJECT || a.vt === VAL.HASH) {
-    if (a.names?.length !== b.names?.length) return false
-    for (let i = 0; i < a.names.length; i++) if (a.names[i] !== b.names[i]) return false
-  }
-  if (a.vt === VAL.ARRAY && a.elem) return shapeLayoutUnifies(a.elem, b.elem)
-  return true
-}
-
-const _jsonShapeCache = new WeakMap()
-function parseJsonShape(src) {
-  if (typeof src !== 'string') return null
-  if (_jsonShapeCache.has(src)) return _jsonShapeCache.get(src)
-  let parsed
-  try { parsed = JSON.parse(src) } catch { _jsonShapeCache.set(Object(src), null); return null }
-  const sh = shapeOfJsonValue(parsed)
-  // WeakMap requires object keys; cache via a wrapper. Skip caching for cold path.
-  return sh
-}
-
-function parseUnifiedJsonShape(srcs) {
-  if (!srcs?.length) return null
-  let out = null
-  for (const src of srcs) {
-    const sh = parseJsonShape(src)
-    if (!sh) return null
-    if (!out) out = sh
-    else if (!shapeLayoutUnifies(out, sh)) return null
-  }
-  return out
-}
-
-/** Resolve the json shape for an expression by walking name → rep.jsonShape and
- *  `.prop` / `[i]` indirection. Returns null when shape is unknown at this site. */
-export function shapeOf(expr) {
-  if (typeof expr === 'string') return ctx.func.repByLocal?.get(expr)?.jsonShape || null
-  if (!Array.isArray(expr)) return null
-  const [op, ...args] = expr
-  if (op === '()' && args[0] === 'JSON.parse') {
-    const srcs = jsonShapeStrings(args[1])
-    if (srcs) return parseUnifiedJsonShape(srcs)
-  }
-  if (op === '.' && typeof args[1] === 'string') {
-    const parent = shapeOf(args[0])
-    if (parent?.vt === VAL.OBJECT || parent?.vt === VAL.HASH) return parent.props[args[1]] || null
-  }
-  if (op === '[]' && args.length === 2) {
-    const parent = shapeOf(args[0])
-    if (parent?.vt === VAL.ARRAY) return parent.elem || null
-  }
-  return null
-}
+// JSON-shape inference lives in src/shape.js — analyze.js (valTypeOf) and module
+// consumers (object, core) both import directly from there. No re-export here.
+import { shapeOf, jsonConstString } from './shape.js'
 
 
 /** Static property-key evaluation for computed member names: folds a node into
@@ -695,7 +571,7 @@ export function ctorFromElemAux(aux) {
 /** Sentinel returned by `ternaryCtorOfRhs` when ternary branches resolve to
  *  different typed-array ctors — caller should drop any cached entry rather
  *  than leave a stale ctor (which would lock the wrong store width). */
-export const MIXED_CTORS = Symbol('MIXED_CTORS')
+const MIXED_CTORS = Symbol('MIXED_CTORS')
 
 const typedCtorElemValType = (ctor) => {
   if (!ctor) return null
@@ -712,7 +588,7 @@ const isCondExpr = e => Array.isArray(e) && (e[0] === '?:' || e[0] === '&&' || e
  *  - a single ctor string when every branch resolves to the same ctor,
  *  - MIXED_CTORS when branches resolve to different ctors,
  *  - null when no branch resolves (caller's behavior unchanged). */
-export function ternaryCtorOfRhs(rhs) {
+function ternaryCtorOfRhs(rhs) {
   if (!Array.isArray(rhs)) return null
   const op = rhs[0]
   const lo = op === '?:' ? 2 : (op === '&&' || op === '||') ? 1 : 0
@@ -722,93 +598,12 @@ export function ternaryCtorOfRhs(rhs) {
   return a && b ? (a === b ? a : MIXED_CTORS) : (a || b || null)
 }
 
-// === Cross-call argument inference helpers (used by narrowSignatures fixpoint) ===
-// Each `inferArg*(expr, ...callerCtx)` resolves an argument expression to a single
-// fact (val/schemaId/elem*/typedCtor) using caller-local observations and program
-// facts, returning null when the fact can't be determined at this call site.
-
-/** Infer arg val type using caller's body-local valTypes and module globals. */
-export function inferArgType(expr, callerValTypes) {
-  if (typeof expr === 'string') return callerValTypes?.get(expr) || ctx.scope.globalValTypes?.get(expr) || null
-  return valTypeOf(expr)
-}
-
-/** Infer arg schemaId. Sources: caller's per-param schemaId map, module-level
- *  ctx.schema.vars binding, or a static-key object literal. */
-export function inferArgSchema(expr, callerSchemas) {
-  if (typeof expr === 'string') {
-    if (callerSchemas?.has(expr)) return callerSchemas.get(expr)
-    const id = ctx.schema.vars.get(expr)
-    return id != null ? id : null
-  }
-  if (Array.isArray(expr) && expr[0] === '{}') {
-    const parsed = staticObjectProps(expr.slice(1))
-    return parsed ? ctx.schema.register(parsed.names) : null
-  }
-  return null
-}
-
-/** Infer arg arr-elem-schema. Sources: caller's body-local arr-elem map, caller's
- *  per-param arr-elem (transitive), or a call to an arr-narrowed user fn. */
-export function inferArgArrElemSchema(expr, callerArrElems, callerArrParams) {
-  if (typeof expr === 'string') {
-    if (callerArrElems?.has(expr)) {
-      const v = callerArrElems.get(expr)
-      if (v != null) return v
-    }
-    if (callerArrParams?.has(expr)) {
-      const v = callerArrParams.get(expr)
-      if (v != null) return v
-    }
-    return null
-  }
-  if (Array.isArray(expr) && expr[0] === '()' && typeof expr[1] === 'string') {
-    const f = ctx.func.map?.get(expr[1])
-    if (f?.arrayElemSchema != null) return f.arrayElemSchema
-  }
-  return null
-}
-
-/** Infer arg arr-elem-VAL. Mirrors inferArgArrElemSchema but tracks VAL.* element kind. */
-export function inferArgArrElemValType(expr, callerArrElemVals, callerArrValParams) {
-  if (typeof expr === 'string') {
-    if (callerArrElemVals?.has(expr)) {
-      const v = callerArrElemVals.get(expr)
-      if (v != null) return v
-    }
-    if (callerArrValParams?.has(expr)) {
-      const v = callerArrValParams.get(expr)
-      if (v != null) return v
-    }
-    return null
-  }
-  if (Array.isArray(expr) && expr[0] === '()' && typeof expr[1] === 'string') {
-    const f = ctx.func.map?.get(expr[1])
-    if (f?.arrayElemValType != null) return f.arrayElemValType
-  }
-  return null
-}
-
-/** Infer typed-array ctor (`new.Float64Array` etc.) of an arg expression at a call site.
- *  Sources: caller's body-local typedElems, caller's typed params, literal `new TypedArray(...)`,
- *  calls to typed-narrowed user funcs. Returns null when the ctor can't be determined. */
-export function inferArgTypedCtor(expr, callerTypedElems, callerTypedParams) {
-  if (typeof expr === 'string') {
-    if (callerTypedElems?.has(expr)) return callerTypedElems.get(expr)
-    if (callerTypedParams?.has(expr)) return callerTypedParams.get(expr)
-    return null
-  }
-  const ctor = typedElemCtor(expr)
-  if (ctor) return ctor
-  if (Array.isArray(expr) && expr[0] === '()' && typeof expr[1] === 'string') {
-    const f = ctx.func.map?.get(expr[1])
-    if (f?.sig?.ptrKind === VAL.TYPED && f.sig.ptrAux != null) return ctorFromElemAux(f.sig.ptrAux)
-  }
-  return null
-}
+// Cross-call argument inference helpers (`infer*`) live in src/infer.js —
+// they're the call-site mirror of the body-walk evidence sources and pair
+// naturally with that registry. Consumed by src/narrow.js' signature fixpoint.
 
 // Per-body memoization: analyzeBody is a pure function of `body` plus a small
-// set of ctx fields (func.locals, func.repByLocal, func.map[*][field]). compile.js
+// set of ctx fields (func.locals, func.localReps, func.map[*][field]). compile.js
 // calls slices of it many times per function (scan-fixpoint, narrowing, final
 // lowering); the unified cache absorbs that traffic. Caller-mutation safety is
 // preserved by cloning every Map on read (entry value stored once, copies handed out).
@@ -847,9 +642,8 @@ const _bodyFactsCache = new WeakMap()
 
 /**
  * Returns the cached facts object directly — DO NOT MUTATE the returned maps.
- * Callers that need to extend (e.g. add params to locals) must clone explicitly.
- * `analyzeLocals` is the canonical clone-then-extend facade; everywhere else
- * reads slices via `analyzeBody(body).<slice>`.
+ * Callers that need to extend (e.g. add params to locals) must clone explicitly
+ * before mutating. Slice reads via `analyzeBody(body).<slice>`.
  */
 export function analyzeBody(body) {
   // Non-object bodies (`() => 0`, `() => x`, missing) have nothing to observe
@@ -901,14 +695,14 @@ export function analyzeBody(body) {
 
   const elemValOf = (name) => {
     if (typeof name !== 'string') return null
-    const repVt = ctx.func.repByLocal?.get(name)?.arrayElemValType
+    const repVt = ctx.func.localReps?.get(name)?.arrayElemValType
     if (repVt) return repVt
     return arrElemValTypes.get(name) || null
   }
 
   const exprElemSourceVal = (expr) => {
     if (typeof expr === 'string') {
-      const repVt = ctx.func.repByLocal?.get(expr)?.val
+      const repVt = ctx.func.localReps?.get(expr)?.val
       if (repVt) return repVt
       return ctx.scope.globalValTypes?.get(expr) || null
     }
@@ -998,7 +792,7 @@ export function analyzeBody(body) {
         if (sid2 != null) observeArrSchema(name, sid2)
       }
       if (typeof rhs === 'string') {
-        const repSid = ctx.func.repByLocal?.get(rhs)?.arrayElemSchema
+        const repSid = ctx.func.localReps?.get(rhs)?.arrayElemSchema
         if (repSid != null) observeArrSchema(name, repSid)
       }
     }
@@ -1047,7 +841,7 @@ export function analyzeBody(body) {
           const refs = ctx.func.refinements
           const hadParam = refs?.has(paramName)
           const prev = hadParam ? refs.get(paramName) : undefined
-          if (refs && recvVt) refs.set(paramName, recvVt)
+          if (refs && recvVt) refs.set(paramName, { val: recvVt })
           let bodyVt = null
           try { bodyVt = valTypeOf(exprBody) }
           finally {
@@ -1109,10 +903,10 @@ export function analyzeBody(body) {
     if (op === 'let' || op === 'const') {
       for (let i = 1; i < node.length; i++) {
         const a = node[i]
-        // analyzeLocals: bare-name decl
+        // analyzeBody: bare-name decl
         if (typeof a === 'string') { if (!locals.has(a)) locals.set(a, 'f64'); continue }
         if (!Array.isArray(a) || a[0] !== '=') continue
-        // analyzeLocals: destructuring decl — set destructured names to f64, walk rhs only
+        // analyzeBody: destructuring decl — set destructured names to f64, walk rhs only
         if (typeof a[1] !== 'string') {
           for (const n of collectParamNames([a[1]])) if (!locals.has(n)) locals.set(n, 'f64')
           walk(a[2])
@@ -1212,12 +1006,10 @@ export function analyzeBody(body) {
   const prevTypedOverlay = ctx.func.localTypedElemsOverlay
   ctx.func.localValTypesOverlay = valTypes
   ctx.func.localTypedElemsOverlay = typedElems
-  try { walk(body) } finally {
-    ctx.func.localValTypesOverlay = prevOverlay
-    ctx.func.localTypedElemsOverlay = prevTypedOverlay
-  }
+  try {
+    walk(body)
 
-  // Second pass: widen i32 locals compared against f64.
+    // Second pass: widen i32 locals compared against f64.
   const CMP_OPS = new Set(['<', '>', '<=', '>=', '==', '!='])
   function widenPass(node) {
     if (!Array.isArray(node)) return
@@ -1260,6 +1052,10 @@ export function analyzeBody(body) {
     }
     recheck(body)
   }
+} finally {
+    ctx.func.localValTypesOverlay = prevOverlay
+    ctx.func.localTypedElemsOverlay = prevTypedOverlay
+  }
 
   const result = { locals, valTypes, arrElemSchemas, arrElemValTypes, typedElems, escapes }
   _bodyFactsCache.set(body, result)
@@ -1268,73 +1064,10 @@ export function analyzeBody(body) {
 
 /** Drop the cached analyzeBody entry for this body. Used by emitFunc after
  *  seeding cross-call param VAL facts so the next walk picks up fresh
- *  `ctx.func.repByLocal` (drives exprType receiver-type lookups).
+ *  `ctx.func.localReps` (drives exprType receiver-type lookups).
  *  Same hook as `invalidateValTypesCache` — split names preserve caller intent. */
 export function invalidateLocalsCache(body) {
   if (body && typeof body === 'object') _bodyFactsCache.delete(body)
-}
-
-// String-only methods: presence of `name.method(...)` is definite evidence that
-// `name` is VAL.STRING. Excludes ambiguous methods (length, slice, indexOf, [],
-// concat) that strings share with arrays/typed-arrays.
-const STRING_ONLY_METHODS = new Set([
-  'charCodeAt', 'charAt', 'codePointAt', 'startsWith', 'endsWith',
-  'toUpperCase', 'toLowerCase', 'toLocaleLowerCase', 'normalize', 'localeCompare',
-  'padStart', 'padEnd', 'repeat', 'trimStart', 'trimEnd', 'trim',
-  'matchAll', 'match', 'replace', 'replaceAll', 'split',
-])
-// Array-only methods: presence rules out STRING.
-const ARRAY_ONLY_METHODS = new Set([
-  'push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'fill', 'reverse',
-  'flat', 'flatMap', 'copyWithin',
-])
-
-/** Infer VAL.STRING for `names` from method-call evidence in `body`.
- *  Descends into nested closures (captured names retain shape) but respects
- *  shadowing: a param of a nested `=>` removes that name from the inference
- *  scope inside that closure. Returns Map<name, VAL.STRING> for names that
- *  have at least one string-only method call and no array-only conflicts. */
-export function inferStringParams(body, names) {
-  if (!names || names.length === 0) return new Map()
-  const evidence = new Map() // name → 'string' | 'conflict'
-  function walk(node, scope) {
-    if (!Array.isArray(node) || scope.size === 0) return
-    const op = node[0]
-    if (op === '=>') {
-      const shadowed = collectParamNames([node[1]])
-      let inner = scope
-      for (const s of shadowed) {
-        if (inner.has(s)) {
-          if (inner === scope) inner = new Set(scope)
-          inner.delete(s)
-        }
-      }
-      walk(node[2], inner)
-      return
-    }
-    // `name.method` — observe positive/negative evidence
-    if (op === '.' && typeof node[1] === 'string' && scope.has(node[1])) {
-      const m = node[2]
-      if (typeof m === 'string') {
-        if (STRING_ONLY_METHODS.has(m)) {
-          if (evidence.get(node[1]) !== 'conflict') evidence.set(node[1], 'string')
-        } else if (ARRAY_ONLY_METHODS.has(m)) {
-          evidence.set(node[1], 'conflict')
-        }
-      }
-    }
-    // Reassignment to an unambiguously non-string RHS poisons the inference
-    if (op === '=' && typeof node[1] === 'string' && scope.has(node[1])) {
-      const rhs = node[2]
-      const vt = valTypeOf(rhs)
-      if (vt && vt !== VAL.STRING) evidence.set(node[1], 'conflict')
-    }
-    for (let i = 1; i < node.length; i++) walk(node[i], scope)
-  }
-  walk(body, new Set(names))
-  const out = new Map()
-  for (const [n, ev] of evidence) if (ev === 'string') out.set(n, VAL.STRING)
-  return out
 }
 
 /** Drop the cached analyzeBody entry. Used after E2-phase valResult narrowing
@@ -1347,14 +1080,14 @@ export function invalidateValTypesCache(body) {
 
 /**
  * Analyze all local value types from declarations and assignments.
- * Writes the per-name `val` field of `ctx.func.repByLocal` for method dispatch
+ * Writes the per-name `val` field of `ctx.func.localReps` for method dispatch
  * and schema resolution.
  */
 export function analyzeValTypes(body) {
   const valPoison = new Set()
   const setVal = (name, vt) => {
     if (valPoison.has(name)) return
-    const prev = ctx.func.repByLocal?.get(name)?.val
+    const prev = ctx.func.localReps?.get(name)?.val
     if (!vt) {
       if (prev) valPoison.add(name)
       updateRep(name, { val: undefined })
@@ -1367,7 +1100,7 @@ export function analyzeValTypes(body) {
     }
     updateRep(name, { val: vt })
   }
-  const getVal = name => ctx.func.repByLocal?.get(name)?.val
+  const getVal = name => ctx.func.localReps?.get(name)?.val
   // Pre-walk: observe Array<schema> facts so `const p = arr[i]` can bind a schemaId
   // on `p`, unlocking schema slot reads + skipping str_key dispatch on `.prop` access.
   // Parallel arrElemValTypes walk records VAL.* element kinds into
@@ -1378,7 +1111,7 @@ export function analyzeValTypes(body) {
   for (const [name, vt] of facts.arrElemValTypes) {
     if (vt != null) updateRep(name, { arrayElemValType: vt })
   }
-  // Propagate body-observed array-elem schemas to repByLocal so analyzePtrUnboxable's
+  // Propagate body-observed array-elem schemas to localReps so unboxablePtrs's
   // `let p = arr[i]` rule (which only consults rep) sees the schema and can unbox `p`
   // to an i32 offset. Without this, `arr.push({x,y,z})` followed by `arr[i].x` reads
   // pay an i64.reinterpret/i32.wrap on every slot access (no aliasing → CSE can't fold).
@@ -1389,7 +1122,7 @@ export function analyzeValTypes(body) {
   // paramReps[k].arrayElemSchema at emit start) over local body observations.
   const arrElemSchemaOf = (name) => {
     if (typeof name !== 'string') return null
-    const repSid = ctx.func.repByLocal?.get(name)?.arrayElemSchema
+    const repSid = ctx.func.localReps?.get(name)?.arrayElemSchema
     if (repSid != null) return repSid
     const localSid = arrElems.get(name)
     return localSid != null ? localSid : null
@@ -1417,7 +1150,7 @@ export function analyzeValTypes(body) {
     const ctor = typedElemCtor(rhs)
     if (ctor) return setOrInvalidate(ctor)
     // TYPED-narrowed call result carries elem aux on f.sig.ptrAux — reverse-map it
-    // back to a canonical ctor string so analyzePtrUnboxable's typedElemAux lookup
+    // back to a canonical ctor string so unboxablePtrs's typedElemAux lookup
     // (compile.js) restores the same aux on the unboxed local's rep.
     if (Array.isArray(rhs) && rhs[0] === '()' && typeof rhs[1] === 'string') {
       const f = ctx.func.map?.get(rhs[1])
@@ -1471,16 +1204,16 @@ export function analyzeValTypes(body) {
         const sh = shapeOf(a[2])
         if (sh) {
           updateRep(a[1], { jsonShape: sh })
-          if (sh.vt === VAL.ARRAY && sh.elem?.vt) {
-            updateRep(a[1], { arrayElemValType: sh.elem.vt })
+          if (sh.val === VAL.ARRAY && sh.elem?.val) {
+            updateRep(a[1], { arrayElemValType: sh.elem.val })
             // Array of fixed-shape OBJECTs: register elem schema so `it = items[j]`
             // → `it.prop` lowers to slot read via the existing arr-elem-schema path.
-            if (sh.elem.vt === VAL.OBJECT && sh.elem.names && ctx.schema.register) {
+            if (sh.elem.val === VAL.OBJECT && sh.elem.names && ctx.schema.register) {
               const elemSid = ctx.schema.register(sh.elem.names)
               updateRep(a[1], { arrayElemSchema: elemSid })
             }
           }
-          if (sh.vt === VAL.OBJECT && sh.names && ctx.schema.register) {
+          if (sh.val === VAL.OBJECT && sh.names && ctx.schema.register) {
             const sid = ctx.schema.register(sh.names)
             updateRep(a[1], { schemaId: sid })
             ctx.schema.vars.set(a[1], sid)
@@ -1490,7 +1223,7 @@ export function analyzeValTypes(body) {
         // calls in this function body see the precise schema. emitDecl rebinds
         // this at emission time too — analyze-time binding is what unlocks the
         // slotVT lookup chain in `analyzeValTypes`'s own walk + per-func emit
-        // dispatch reading repByLocal.
+        // dispatch reading localReps.
         if (vt === VAL.OBJECT && Array.isArray(a[2]) && a[2][0] === '()' && typeof a[2][1] === 'string') {
           const f = ctx.func.map?.get(a[2][1])
           if (f?.sig?.ptrAux != null) updateRep(a[1], { schemaId: f.sig.ptrAux })
@@ -1568,8 +1301,11 @@ const INT_MATH_FNS = new Set(['imul', 'clz32', 'floor', 'ceil', 'round', 'trunc'
  *     `&= |= ^= <<= >>= >>>=` (always int by op result type);
  *     `/=` `**=` poison.
  *
- * Writes `intCertain: true` on `ctx.func.repByLocal[name]`. No emit impact —
- * codegen extensions consume this in follow-up passes.
+ * Writes `intCertain: true` on `ctx.func.localReps[name]`. Consumers:
+ *   • `toNumF64` (src/ir.js) — skips the `__to_num` wrapper since an intCertain
+ *     local never carries a NaN-boxed pointer.
+ *   • `Math.floor/ceil/trunc/round` (module/math.js) — short-circuits to the
+ *     identity, eliding the wasm rounding op on an already-integer operand.
  */
 export function analyzeIntCertain(body) {
   // Pass 1: collect every defining RHS per binding name. Compound assignments
@@ -1688,7 +1424,7 @@ export function analyzeIntCertain(body) {
 export function exprType(expr, locals) {
   if (expr == null) return 'f64'
   if (typeof expr === 'number')
-    return Number.isInteger(expr) && expr >= -2147483648 && expr <= 2147483647 && !Object.is(expr, -0) ? 'i32' : 'f64'
+    return isI32(expr) ? 'i32' : 'f64'
   if (typeof expr === 'string') {
     if (locals?.has?.(expr)) return locals.get(expr)
     const paramType = ctx.func.current?.params?.find(p => p.name === expr)?.type
@@ -1729,7 +1465,7 @@ export function exprType(expr, locals) {
     return 'f64'
   }
   // `.length` on a known sized receiver returns i32 directly (__len/__str_byteLen
-  // both return i32). Letting it stay i32 lets analyzeLocals keep the counter
+  // both return i32). Letting it stay i32 lets analyzeBody keep the counter
   // local i32 too, eliminating the per-iteration `f64.convert_i32_s` widen and
   // the matching `i32.trunc_sat_f64_s` truncs at every `arr[i]` / `i*k` site.
   // Only safe when receiver type is statically known to expose an integer length.
@@ -1776,7 +1512,7 @@ export function exprType(expr, locals) {
     // skipping the f64.convert_i32_u widen at every char read.
     if (Array.isArray(args[0]) && args[0][0] === '.' && args[0][2] === 'charCodeAt') return 'i32'
     // User-function call: consult the callee's narrowed result type. By the time
-    // analyzeLocals runs in emitFunc, narrowSignatures has set sig.results[0]='i32'
+    // analyzeBody runs in emitFunc, narrowSignatures has set sig.results[0]='i32'
     // on every body-i32-only func. Propagating this lets `let h = userFn(...)`
     // (mix in callback bench: i32-FNV) keep h as an i32 local instead of widening
     // to f64 and round-tripping i32↔f64 every iteration.
@@ -1788,15 +1524,9 @@ export function exprType(expr, locals) {
   return 'f64'
 }
 
-/**
- * Analyze all local declarations and assignments to determine types.
- * A local is i32 if ALL assignments produce i32. Any f64 widens to f64.
- *
- * Thin slice of `analyzeBody` (single unified walk).
- */
-export function analyzeLocals(body) {
-  return analyzeBody(body).locals
-}
+// `analyzeBody` was inlined to `analyzeBody(body).locals` at its three real
+// call sites in src/compile.js and src/narrow.js — the one-line facade existed
+// only as a historical surface and obscured the unified-walk relationship.
 
 /**
  * Identify locals that can be stored as an unboxed i32 pointer offset instead of
@@ -1820,10 +1550,10 @@ export function analyzeLocals(body) {
  *
  * Returns Map<name, VAL> of locals to unbox.
  */
-export function analyzePtrUnboxable(body, locals, boxed) {
+export function unboxablePtrs(body, locals, boxed) {
   const candidates = new Set()
   const disqualified = new Set()
-  const valOf = name => ctx.func.repByLocal?.get(name)?.val
+  const valOf = name => ctx.func.localReps?.get(name)?.val
 
   const UNBOXABLE_KINDS = new Set([VAL.OBJECT, VAL.SET, VAL.MAP, VAL.BUFFER, VAL.TYPED, VAL.CLOSURE, VAL.DATE])
 
@@ -1851,7 +1581,7 @@ export function analyzePtrUnboxable(body, locals, boxed) {
       // subsequent `p.x` reads then become direct `f64.load offset=K (local.get $p)`
       // (since ptrOffsetIR sees ptrKind=OBJECT and skips the per-access wrap).
       if (expr[0] === '[]' && typeof expr[1] === 'string') {
-        const repSid = ctx.func.repByLocal?.get(expr[1])?.arrayElemSchema
+        const repSid = ctx.func.localReps?.get(expr[1])?.arrayElemSchema
         return repSid != null
       }
       return false
@@ -2066,64 +1796,10 @@ export function findMutations(node, names, mutated) {
 }
 
 /**
- * Pre-scan AST for variables that need a `__dyn_props` shadow sidecar.
- *
- * The shadow exists so `obj[runtimeKey]` can read a value via `__dyn_get`,
- * and `obj.prop = v` keeps the sidecar in sync. Most object literals are only
- * accessed via `.prop` or `obj['lit']`, both of which resolve through the
- * schema directly and bypass the shadow. Allocating + populating the sidecar
- * for those literals is pure waste.
- *
- * Populates:
- *  - ctx.types.dynKeyVars: Set<string> — names accessed via runtime key
- *  - ctx.types.anyDynKey: boolean — any dynamic key access exists in program
- *    (used for escaping literals where no target var is known)
- */
-export function analyzeDynKeys(...roots) {
-  const dynVars = new Set()
-  let anyDyn = false
-
-  function walk(node) {
-    if (!Array.isArray(node)) return
-    const [op, ...args] = node
-    if (op === '[]') {
-      const [obj, idx] = args
-      if (!isLiteralStr(idx)) {
-        anyDyn = true
-        if (typeof obj === 'string') dynVars.add(obj)
-      }
-    }
-    if (op === '=' && Array.isArray(args[0]) && args[0][0] === '[]') {
-      const [, obj, idx] = args[0]
-      if (!isLiteralStr(idx)) {
-        anyDyn = true
-        if (typeof obj === 'string') dynVars.add(obj)
-      }
-    }
-    // Runtime for-in (compile-time unroll didn't fire) → walks via shadow
-    if (op === 'for-in') {
-      anyDyn = true
-      if (typeof args[1] === 'string') dynVars.add(args[1])
-    }
-    for (const a of args) walk(a)
-  }
-  for (const r of roots) walk(r)
-  if (ctx.func.list) for (const f of ctx.func.list) if (f.body) walk(f.body)
-  const initFacts = ctx.module.initFacts
-  if (initFacts?.anyDyn) {
-    anyDyn = true
-    for (const v of initFacts.dynVars) dynVars.add(v)
-  }
-
-  ctx.types.dynKeyVars = dynVars
-  ctx.types.anyDynKey = anyDyn
-}
-
-/**
  * Pre-scan function body for captured variables that are mutated.
  * Marks mutably-captured vars in ctx.func.boxed for cell-based capture.
  */
-export function analyzeBoxedCaptures(body) {
+export function boxedCaptures(body) {
   const outerScope = new Set()
   ;(function collectDecls(node) {
     if (!Array.isArray(node)) return
@@ -2225,7 +1901,7 @@ export function narrowReturnArrayElems(field, paramReps, valueUsed) {
       for (const p of func.sig.params) if (!ctx.func.locals.has(p.name)) ctx.func.locals.set(p.name, p.type)
       const localElems = facts[sliceKey]
       ctx.func.locals = savedLocals
-      const paramElemMap = callerParamFactMap(paramReps, func, field) || new Map()
+      const paramElemMap = paramFactsOf(paramReps, func, field) || new Map()
       const resolveExpr = (expr) => {
         if (typeof expr === 'string') {
           if (localElems.has(expr)) {

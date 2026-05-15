@@ -7,6 +7,8 @@
  * Refactored into focused sub-contexts for better maintainability.
  */
 
+import { resolve as resolveAbi } from './abi/index.js'
+
 // === Carrier layout ===
 // i64 carrier holds either:
 //   - raw f64 number bits (any non-NaN-shape pattern), discriminated by
@@ -84,6 +86,10 @@ export const ctx = {
   memory: {},     // module memory config (pages, shared)
   error: {},      // source location carried through emit for err() messages
   transform: {},  // compile-time options (jzify, etc.)
+  abi: {},        // per-type rep lookup (see abi/index.js). { number: rep, string: rep, ... }
+                  // Set by reset() from opts.abi (default preset 'nanbox'). Read by codegen
+                  // sites that delegate rep-specific behavior — today just the optimizer's
+                  // peephole hook; expanding as more reps land.
 }
 
 /** Create a child scope via shallow flat copy (metacircular-safe: no prototype chain).
@@ -97,19 +103,26 @@ export const inc = (...names) => names.forEach(n => ctx.core.includes.add(n))
  *  Each module co-locates its own deps with its stdlib registrations at init time. */
 export function resolveIncludes() {
   const graph = ctx.core.stdlibDeps
-  const queue = [...ctx.core.includes]
-  while (queue.length) {
-    const name = queue.pop()
-    const entry = graph[name]
-    const deps = typeof entry === 'function' ? entry() : entry
-    if (deps) for (const dep of deps) {
-      if (!ctx.core.includes.has(dep)) { ctx.core.includes.add(dep); queue.push(dep) }
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const name of [...ctx.core.includes]) {
+      const entry = graph[name]
+      const deps = typeof entry === 'function' ? entry() : entry
+      if (deps) for (const dep of deps) {
+        if (!ctx.core.includes.has(dep)) {
+          ctx.core.includes.add(dep)
+          changed = true
+        }
+      }
     }
   }
 }
 
-/** Reset all compilation state. Called once per jz() invocation. */
-export function reset(proto, globals) {
+/** Reset all compilation state. Called once per jz() invocation.
+ *  `abi` is an optional preset name or rep map (defaults to 'nanbox'); compile entry
+ *  passes the user-supplied `opts.abi` through after validation. */
+export function reset(proto, globals, abi) {
   ctx.core = {
     emit: derive(proto),
     stdlib: {},
@@ -141,7 +154,7 @@ export function reset(proto, globals) {
     globalTypes: new Map(),
     globalValTypes: null,
     globalTypedElem: null,
-    repByGlobal: null, // Map<name, ValueRep> — module-level pointer reps (TYPED const globals stored as raw i32 offset, etc.)
+    globalReps: null, // Map<name, ValueRep> — module-level pointer reps (TYPED const globals stored as raw i32 offset, etc.)
     consts: null,
   }
 
@@ -152,13 +165,20 @@ export function reset(proto, globals) {
     exports: {},
     current: null,
     locals: new Map(),
-    repByLocal: null,
-    refinements: new Map(),  // flow-sensitive: name → VAL.* inside a type-guarded branch
+    localReps: null,
+    refinements: new Map(),  // flow-sensitive: name → {val?: VAL.*, notString?: true} inside a type-guarded branch
     boxed: new Map(),
     stack: [],
     uniq: 0,
     inTry: false,
     localProps: null,
+    // Pass-scoped overlays installed by analyzeBody/observeSlots. While set,
+    // `lookupValType`/`typedElemCtor` consult the in-progress fact maps before
+    // falling back to global state — lets shorthand `{x}` / typed-array writes
+    // observe locals that haven't been promoted to ctx.types yet. Saved/restored
+    // by the pass owners so re-entrant analyzeBody calls don't clobber each other.
+    localValTypesOverlay: null,
+    localTypedElemsOverlay: null,
   }
 
   ctx.types = {
@@ -227,10 +247,19 @@ export function reset(proto, globals) {
                         // 'hook': Xahau Hook smart contract. Enforces: guard insertion,
                         //   no SIMD/exception/memory.grow/return_call, imports ⊆ env.* Hook API,
                         //   exports exactly hook(i32)→i64 [+ cbak(i32)→i64].
+                        // 'wasi': error at compile time if any `__ext_*` import would be emitted,
+                        //   since wasmtime/wasmer hosts have no JS runtime to satisfy them.
     hookOn: 0xFFFFFFFFFFFFFFFFn,   // sfHookOn bitmask (BigInt, used in SetHook metadata)
     hookNamespace: null,            // sfHookNamespace (32-byte hex string or null)
     hookMaxIter: 65535,             // Default loop guard max iteration count for _g() insertion
+    inspect: false,     // when true, compile() additionally populates ctx.inspect with the inferred
+                        // per-function signatures, locals, and JSON shapes — readable by editor
+                        // hosts for inlay hints / hover types without re-running the analyzer.
   }
+
+  // Inspection sink. Populated by compile() only when transform.inspect is true.
+  // Shape: { abi, functions: { [name]: { exported, params, results, ptrKind?, locals, callerReps } }, schemas }.
+  ctx.inspect = null
 
   // Feature flags: capabilities the compiled module may exercise at runtime.
   // Set true by producer sites (import points, auto-imports, dynamic call sites).
@@ -247,6 +276,8 @@ export function reset(proto, globals) {
   //   (b) a capability needs an opt-in A/B switch against the default path
   //       (SSO is the planned first user — default string-literal emission
   //       currently forces SSO for ≤4 ASCII chars at string.js:49)
+  ctx.abi = resolveAbi(abi)
+
   ctx.features = {
     external: false,  // PTR.EXTERNAL possible — opts.imports, HOST_GLOBALS, or __ext_call site. WIRED.
     hash: false,      // PTR.HASH + __dyn_* substrate. Organic: any inc(__hash_*/__dyn_*) implies on.

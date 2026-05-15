@@ -7,7 +7,7 @@
   "exports": {
     ".": "./index.js",
     "./wasi": "./wasi.js",
-    "./interop": "./interop/nanbox.js",
+    "./interop": "./interop/index.js",
     "./interop/nanbox": "./interop/nanbox.js",
     "./types": "./types/hook.d.ts"
   },

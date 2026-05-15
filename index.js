@@ -53,6 +53,7 @@ import {
   memory as enhanceMemory, instantiate as instantiateRuntime,
 } from './interop/nanbox.js'
 import { validateHook } from './src/hook-validate.js'
+import { PRESETS, DEFAULT_PRESET, presetName } from './src/abi/index.js'
 
 // A host import that's a JS function may hand back any value, including a host
 // object — which arrives in wasm as a PTR.EXTERNAL ref. Constants/typed specs can't.
@@ -137,6 +138,28 @@ const appendFunctionNames = (wasm, module) => {
   return out
 }
 
+// `jz:abi` custom section carrying just the preset name as UTF-8 bytes.
+// `jz/interop` sniffs this on instantiate to dispatch to the matching driver.
+// Emitted only when the resolved preset *differs* from the default (`nanbox`):
+// otherwise the absence of the section is itself a signal — the host falls
+// back to the default. Keeps default-output bytes at exact parity with
+// pre-ABI-machinery output.
+const abiSection = (name) => {
+  const payload = [...nameBytes('jz:abi'), ...utf8Bytes(name)]
+  return Uint8Array.from([0, ...uleb(payload.length), ...payload])
+}
+
+const appendAbiSection = (wasm, abi) => {
+  if (abi === PRESETS[DEFAULT_PRESET]) return wasm
+  const name = presetName(abi)
+  if (!name) return wasm   // defensive: preset not in table → skip (no recorded discriminant)
+  const section = abiSection(name)
+  const out = new Uint8Array(wasm.length + section.length)
+  out.set(wasm)
+  out.set(section, wasm.length)
+  return out
+}
+
 /**
  * jz — JS subset → WASM compiler.
  *
@@ -178,7 +201,15 @@ jz.memory = enhanceMemory
  * @param {boolean} [opts.profileNames] - Legacy alias for `profile.names`.
  * @param {string} [opts.importMetaUrl] - Module URL used to lower `import.meta.url`
  *   and static `import.meta.resolve("...")` expressions.
- * @returns {Uint8Array|string}
+ * @param {string} [opts.abi] - ABI preset name (default `'nanbox'`). Picks a
+ *   tested combination of per-type reps. Recorded in a `jz:abi` custom section
+ *   (only when non-default) so `jz/interop` can sniff and dispatch.
+ * @param {boolean} [opts.inspect] - When true, return `{ wasm, inspect }`
+ *   (or `{ wat, inspect }` with `opts.wat`) instead of the bare output.
+ *   `inspect` carries per-function inferred shapes (params, locals, JSON shapes,
+ *   cross-call paramReps) for editor hosts to drive inlay hints / hover types
+ *   without re-running the analyzer. Pays a small serialization cost; off by default.
+ * @returns {Uint8Array|string|{wasm: Uint8Array, inspect: object}|{wat: string, inspect: object}}
  */
 jz.compile = (code, opts = {}) => {
   try {
@@ -198,7 +229,7 @@ const jzCompileInner = (code, opts = {}) => {
   const profiler = compileProfiler(opts.profile)
   const time = (name, fn) => profiler ? profiler.time(name, fn) : fn()
 
-  reset(emitter, GLOBALS)
+  reset(emitter, GLOBALS, opts.abi)
   ctx.error.src = code
 
   if (typeof opts.memory === 'number') ctx.memory.pages = opts.memory
@@ -230,6 +261,7 @@ const jzCompileInner = (code, opts = {}) => {
     }
   }
   if (opts.alloc === false) ctx.transform.alloc = false
+  if (opts.inspect) ctx.transform.inspect = true
   if (opts.importMetaUrl) ctx.transform.importMetaUrl = String(opts.importMetaUrl)
   if (opts.nativeTimers) ctx.features.blockingTimers = true  // wasmtime CLI: include __timer_loop in _start
   ctx.transform.optimize = resolveOptimize(opts.optimize)
@@ -333,16 +365,20 @@ const jzCompileInner = (code, opts = {}) => {
     })
   }
   try {
-    if (opts.wat) return time('watrPrint', () => watrPrint(optimized))
+    if (opts.wat) {
+      const wat = time('watrPrint', () => watrPrint(optimized))
+      return opts.inspect ? { wat, inspect: ctx.inspect } : wat
+    }
     const wasm = time('watrCompile', () => watrCompile(optimized))
-    const namedWasm = (opts.profileNames || opts.profile?.names) ? appendFunctionNames(wasm, optimized) : wasm
+    let bytes = appendAbiSection(wasm, ctx.abi)
+    if (opts.profileNames || opts.profile?.names) bytes = appendFunctionNames(bytes, optimized)
     // Hook validation: run automatically when host='hook' (or when --validate is explicitly passed).
     // The validate pass is fast and provides essential early feedback about Hook binary compliance.
     if (ctx.transform.host === 'hook' || opts.validate) {
-      const result = validateHook(namedWasm)
+      const result = validateHook(bytes)
       if (opts.verbose) process.stderr.write(`Hook validated: ${result.bytes} bytes\n`)
     }
-    return namedWasm
+    return opts.inspect ? { wasm: bytes, inspect: ctx.inspect } : bytes
   } catch (e) {
     // watr surfaces dangling identifiers as "Unknown local|func|global|table|memory $X".
     // That's always a jz codegen leak — we emitted IR that references something never
@@ -429,7 +465,14 @@ export default function jz(code, ...args) {
 
   // String call: jz('code', opts?) — compile + instantiate + wrap
   const callOpts = args[0] || {}
-  return instantiateRuntime(jz.compile(code, callOpts), callOpts)
+  const out = jz.compile(code, callOpts)
+  // inspect:true returns { wasm, inspect } from jz.compile — unwrap the bytes for
+  // instantiation and surface inspect on the runtime result alongside exports/memory.
+  if (callOpts.inspect && out && typeof out === 'object' && 'wasm' in out) {
+    const result = instantiateRuntime(out.wasm, callOpts)
+    return Object.assign(result, { inspect: out.inspect })
+  }
+  return instantiateRuntime(out, callOpts)
 }
 
 export { jz }

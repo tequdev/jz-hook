@@ -39,6 +39,7 @@ export const OP_MODULES = {
   'typeof': ['core', 'string'],
   '[': ['core', 'array'],
   '{': ['core', 'object', 'string', 'collection'],
+  'delete': ['core', 'collection', 'string'],
   '//': ['core', 'string', 'regex'],
   '**': ['math'],
 }
@@ -62,8 +63,10 @@ export const CALL_MODULES = dict({
   'console.error': ['core', 'string', 'number', 'console'],
   'Object.fromEntries': ['collection', 'string'],
   'Object.keys': ['core', 'object', 'string'],
+  'Object.getOwnPropertyNames': ['core', 'object', 'string'],
   'Object.values': ['core', 'object', 'string'],
   'Object.entries': ['core', 'object', 'string'],
+  'Object.freeze': ['core', 'object'],
   'Object.assign': ['core', 'object'],
   'Object.create': ['core', 'object'],
   'Object.defineProperty': ['core', 'object'],
@@ -85,6 +88,10 @@ export const CALL_MODULES = dict({
   'Int8Array.from': ['core', 'typedarray', 'array'],
   'Uint8Array.from': ['core', 'typedarray', 'array'],
   'ArrayBuffer.isView': ['core', 'typedarray'],
+  // instanceof Map / Set / TypedArray predicates (synthesized by jzify).
+  '__is_map': ['core', 'collection'],
+  '__is_set': ['core', 'collection'],
+  '__is_typed': ['core', 'typedarray'],
 })
 
 export const GENERIC_METHOD_MODULES = dict({

@@ -8,7 +8,8 @@
  *        narrowed signatures, finalized global reps, and per-call decisions.
  *
  * # Pipeline (top-level `plan(ast)`)
- *   1. scanGlobalValueFacts / unboxConstTypedGlobals — finalize global storage.
+ *   1. unboxConstTypedGlobals — finalize global storage. (Global value facts
+ *      themselves are seeded by prepare via `infer.recordGlobalRep`.)
  *   2. collectProgramFacts — sweep arrow bodies for typed-elem usage, key sets,
  *      loop depth, control-transfer shapes; rerun if hot inlining changes the AST.
  *   3. materializeAutoBoxSchemas / resolveClosureWidth — settle layout decisions.
@@ -24,7 +25,7 @@
  */
 
 import { ctx } from './ctx.js'
-import { T, VAL, ASSIGN_OPS, analyzeBody, invalidateLocalsCache, staticObjectProps, staticPropertyKey, valTypeOf, typedElemCtor, typedElemAux, updateGlobalRep, collectProgramFacts, extractParams } from './analyze.js'
+import { T, VAL, ASSIGN_OPS, analyzeBody, invalidateLocalsCache, staticObjectProps, staticPropertyKey, typedElemCtor, typedElemAux, updateGlobalRep, collectProgramFacts, extractParams } from './analyze.js'
 import { MAX_CLOSURE_ARITY } from './ir.js'
 import narrowSignatures, { specializeBimorphicTyped, refineDynKeys } from './narrow.js'
 
@@ -1024,7 +1025,9 @@ const inlineHotInternalCalls = (programFacts, ast) => {
     const sites = sitesByCallee.get(func.name)
     const fixedTypedArraySite = hasFixedTypedArraySites(func, sites)
     const fullyFixedTypedArraySite = hasFullyFixedTypedArraySites(func, sites)
-    if (!sites || sites.length < 1 || (!fixedTypedArraySite && sites.length > 2) || sites.length > 8) continue
+    const hasLoop = scanBody(func.body, n => LOOP_OPS.has(n[0]))
+    const isTinyLeaf = !hasLoop && nodeSize(func.body) <= 15
+    if (!sites || sites.length < 1 || (!isTinyLeaf && !fixedTypedArraySite && sites.length > 2) || sites.length > 8) continue
     const stmts = blockStmts(func.body)
     // Expression-bodied arrow funcs (`(c) => expr`) have no block — body IS the
     // return value. Treat as a "tiny leaf" branch handled below; force hasLoop=false.
@@ -1043,9 +1046,8 @@ const inlineHotInternalCalls = (programFacts, ast) => {
     // The leaf branch catches helpers like `isAlpha(c) => (c>=65 && c<=90) || …`
     // that get hammered from a hot caller's loop — replacing the call with its
     // body saves the per-iteration call+reinterpret overhead (tokenizer hot path).
-    const hasLoop = scanBody(func.body, n => LOOP_OPS.has(n[0]))
     if (!hasLoop) {
-      if (scanBody(func.body, n => n[0] === '()')) continue
+      if (scanBody(func.body, n => n[0] === '()' && typeof n[1] === 'string' && ctx.func.names.has(n[1]))) continue
       if (nodeSize(func.body) > 30) continue
     }
     if (scanBody(func.body, n => n[0] === '()' && n[1] === func.name)) continue
@@ -1093,7 +1095,16 @@ const inlineHotInternalCalls = (programFacts, ast) => {
     // caller's heap arrays.
     const activeCandidates = func.exported ? exportedCandidates : candidates
     if (func.exported && !activeCandidates.size) continue
-    const r = inlineInStmt(func.body, activeCandidates)
+    // Expression-bodied arrows (`() => expr`) have func.body as the return
+    // value itself — never a `{}` block. inlineInStmt treats its argument as a
+    // statement (discards the return value of any top-level candidate call),
+    // which would turn `() => x()` into an empty block and lose the result.
+    // Route those through inlineInExpr so the call is replaced by the inlined
+    // value expression instead.
+    const isExprBody = !Array.isArray(func.body) || func.body[0] !== '{}'
+    const r = isExprBody
+      ? inlineInExpr(func.body, activeCandidates)
+      : inlineInStmt(func.body, activeCandidates)
     let body = r.changed ? r.node : func.body
     let bodyChanged = r.changed
     if (!func.exported && exprOnlyCandidates.size) {
@@ -1341,27 +1352,9 @@ const specializeFixedRestCalls = (programFacts) => {
   return changed
 }
 
-const scanGlobalValueFacts = (root) => {
-  if (!root) return
-  const stmts = Array.isArray(root) && root[0] === ';' ? root.slice(1) : [root]
-  for (const stmt of stmts) {
-    if (!Array.isArray(stmt) || (stmt[0] !== 'const' && stmt[0] !== 'let')) continue
-    for (const decl of stmt.slice(1)) {
-      if (!Array.isArray(decl) || decl[0] !== '=' || typeof decl[1] !== 'string') continue
-      const vt = valTypeOf(decl[2])
-      if (vt) {
-        if (!ctx.scope.globalValTypes) ctx.scope.globalValTypes = new Map()
-        ctx.scope.globalValTypes.set(decl[1], vt)
-        if (vt === VAL.REGEX && ctx.runtime.regex) ctx.runtime.regex.vars.set(decl[1], decl[2])
-      }
-      const ctor = typedElemCtor(decl[2])
-      if (ctor) {
-        if (!ctx.scope.globalTypedElem) ctx.scope.globalTypedElem = new Map()
-        ctx.scope.globalTypedElem.set(decl[1], ctor)
-      }
-    }
-  }
-}
+// `scanGlobalValueFacts` was deleted — prepare's depth-0 catch (calling
+// `recordGlobalRep` from src/infer.js) is the authoritative pass and a
+// strict superset of what this top-level walker observed.
 
 const unboxConstTypedGlobals = () => {
   if (!ctx.scope.globalTypedElem || !ctx.scope.consts) return
@@ -1434,7 +1427,6 @@ const canSkipWholeProgramNarrowing = (programFacts) =>
   !ctx.closure.make
 
 export default function plan(ast) {
-  scanGlobalValueFacts(ast)
   unboxConstTypedGlobals()
 
   let programFacts = collectProgramFacts(ast)
