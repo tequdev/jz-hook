@@ -443,12 +443,12 @@ export default (ctx) => {
   // float_sto(out, currency_buf, issuer_buf, xfl, field_code) → i64
   ctx.core.emit['hook.float_sto'] = (out, currency, issuer, xfl, fieldCode) =>
     typed(['call', '$hook_float_sto',
-      ...hookCapArgs(out), ...hookBufArgs(currency), ...hookBufArgs(issuer),
+      ...hookCapArgs(out), ...hookValArgs(currency), ...hookValArgs(issuer),
       e64(xfl), e32(fieldCode)], 'i64')
 
   // float_sto_set(sto_buf) → i64
   ctx.core.emit['hook.float_sto_set'] = (buf) =>
-    typed(['call', '$hook_float_sto_set', ...hookBufArgs(buf)], 'i64')
+    typed(['call', '$hook_float_sto_set', ...hookValArgs(buf)], 'i64')
 
   // accept(msg, code) → accept(msg_ptr, msg_len, code_i64)
   ctx.core.emit['hook.accept'] = (msg, code) =>
@@ -478,11 +478,11 @@ export default (ctx) => {
 
   // state(out_buf, key) → state(wptr, wlen, kptr, klen)
   ctx.core.emit['hook.state'] = (out, key) =>
-    typed(['call', '$hook_state', ...hookCapArgs(out), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_state', ...hookCapArgs(out), ...hookValArgs(key)], 'i64')
 
   // state_set(val_buf, key)
   ctx.core.emit['hook.state_set'] = (val, key) =>
-    typed(['call', '$hook_state_set', ...hookValArgs(val), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_state_set', ...hookValArgs(val), ...hookValArgs(key)], 'i64')
 
   // hookNullableCapArgs: undefined → (ptr=0, len=0); otherwise hookCapArgs
   // Passing (0,0) to Hook API output functions queries field size without writing.
@@ -518,16 +518,16 @@ export default (ctx) => {
 
   // hook_param(out_buf, key) → i64
   ctx.core.emit['hook.hook_param'] = (out, key) =>
-    typed(['call', '$hook_hook_param', ...hookCapArgs(out), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_hook_param', ...hookCapArgs(out), ...hookValArgs(key)], 'i64')
 
   // hook_param_set(val, key, hook_hash) → i64
   ctx.core.emit['hook.hook_param_set'] = (val, key, hookHash) =>
     typed(['call', '$hook_hook_param_set',
-      ...hookValArgs(val), ...hookStrArgs(key), ...hookBufArgs(hookHash)], 'i64')
+      ...hookValArgs(val), ...hookValArgs(key), ...hookValArgs(hookHash)], 'i64')
 
   // otxn_param(out_buf, key) → i64
   ctx.core.emit['hook.otxn_param'] = (out, key) =>
-    typed(['call', '$hook_otxn_param', ...hookCapArgs(out), ...hookStrArgs(key)], 'i64')
+    typed(['call', '$hook_otxn_param', ...hookCapArgs(out), ...hookValArgs(key)], 'i64')
 
   // ledger_last_hash() → scratch; ledger_last_hash(out_buf) → user buffer
   ctx.core.emit['hook.ledger_last_hash'] = (out) => {
@@ -568,7 +568,7 @@ export default (ctx) => {
 
   // slot_set(buf, slot_no)
   ctx.core.emit['hook.slot_set'] = (buf, slotNo) =>
-    typed(['call', '$hook_slot_set', ...hookBufArgs(buf), e32(slotNo)], 'i64')
+    typed(['call', '$hook_slot_set', ...hookValArgs(buf), e32(slotNo)], 'i64')
 
   // slot_subfield(parent, field_id, new_slot)
   ctx.core.emit['hook.slot_subfield'] = (parent, fid, newSlot) =>
@@ -594,7 +594,7 @@ export default (ctx) => {
   // util_sha512h(out, input)
   ctx.core.emit['hook.util_sha512h'] = (out, input) =>
     typed(['call', '$hook_util_sha512h',
-      ...hookCapArgs(out), ...hookBufArgs(input)], 'i64')
+      ...hookCapArgs(out), ...hookValArgs(input)], 'i64')
 
   // util_accid(out, raddr_str)
   ctx.core.emit['hook.util_accid'] = (out, raddr) =>
@@ -604,12 +604,12 @@ export default (ctx) => {
   // util_raddr(out, accid_buf)
   ctx.core.emit['hook.util_raddr'] = (out, accid) =>
     typed(['call', '$hook_util_raddr',
-      ...hookCapArgs(out), ...hookBufArgs(accid)], 'i64')
+      ...hookCapArgs(out), ...hookValArgs(accid)], 'i64')
 
   // util_verify(sig, data, pubkey)
   ctx.core.emit['hook.util_verify'] = (sig, data, pubkey) =>
     typed(['call', '$hook_util_verify',
-      ...hookBufArgs(sig), ...hookBufArgs(data), ...hookBufArgs(pubkey)], 'i64')
+      ...hookValArgs(sig), ...hookValArgs(data), ...hookValArgs(pubkey)], 'i64')
 
   // emit(out_buf, tx_buf)
   ctx.core.emit['hook.emit'] = (out, tx) =>
@@ -621,15 +621,15 @@ export default (ctx) => {
 
   // sto_subfield(buf, field_id)
   ctx.core.emit['hook.sto_subfield'] = (buf, fid) =>
-    typed(['call', '$hook_sto_subfield', ...hookBufArgs(buf), e32(fid)], 'i64')
+    typed(['call', '$hook_sto_subfield', ...hookValArgs(buf), e32(fid)], 'i64')
 
   // sto_subarray(buf, array_id)
   ctx.core.emit['hook.sto_subarray'] = (buf, aid) =>
-    typed(['call', '$hook_sto_subarray', ...hookBufArgs(buf), e32(aid)], 'i64')
+    typed(['call', '$hook_sto_subarray', ...hookValArgs(buf), e32(aid)], 'i64')
 
   // sto_validate(buf)
   ctx.core.emit['hook.sto_validate'] = (buf) =>
-    typed(['call', '$hook_sto_validate', ...hookBufArgs(buf)], 'i64')
+    typed(['call', '$hook_sto_validate', ...hookValArgs(buf)], 'i64')
 
   // sto_emplace(write_ptr, write_len, sread_ptr, sread_len, fread_ptr, fread_len, field_id) → i64
   ctx.core.emit['hook.sto_emplace'] = (...args) =>
@@ -642,14 +642,14 @@ export default (ctx) => {
   // state_foreign(out, key, ns, acc)
   ctx.core.emit['hook.state_foreign'] = (out, key, ns, acc) =>
     typed(['call', '$hook_state_foreign',
-      ...hookNullableCapArgs(out), ...hookStrArgs(key),
-      ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
+      ...hookNullableCapArgs(out), ...hookValArgs(key),
+      ...hookValArgs(ns), ...hookValArgs(acc)], 'i64')
 
   // state_foreign_set(val, key, ns, acc)
   ctx.core.emit['hook.state_foreign_set'] = (val, key, ns, acc) =>
     typed(['call', '$hook_state_foreign_set',
-      ...hookValArgs(val), ...hookStrArgs(key),
-      ...hookBufArgs(ns), ...hookBufArgs(acc)], 'i64')
+      ...hookValArgs(val), ...hookValArgs(key),
+      ...hookValArgs(ns), ...hookValArgs(acc)], 'i64')
 
   // === Scratch buffer emitters (Change 4) ===
   ctx.core.emit['hook.SCRATCH_PTR'] = () => typed(['i32.const', HOOK_SCRATCH_OFFSET], 'i32')

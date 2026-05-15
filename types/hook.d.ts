@@ -22,18 +22,19 @@ declare module 'hook' {
   /** i32 value: field codes, slot numbers, counts, boolean flags. */
   type I32 = number
   /** Read buffer: string literals or byte arrays passed as input to host functions. */
-  type ReadBuf = string | Uint8Array
+  type ReadBuf = string | Uint8Array | Array | number[] | string[]
+
   /** Write buffer: mutable Uint8Array that receives output from host functions. */
-  type WriteBuf = Uint8Array
+  type WriteBuf = Uint8Array | Array
 
   // ---------------------------------------------------------------------------
   // Control
   // ---------------------------------------------------------------------------
 
   /** Accept the originating transaction. msg is returned in the metadata. */
-  export function accept(msg: ReadBuf, code?: I64): I64
+  export function accept(msg: string, code?: I64): I64
   /** Reject the originating transaction. */
-  export function rollback(msg: ReadBuf, code?: I64): I64
+  export function rollback(msg: string, code?: I64): I64
 
   // ---------------------------------------------------------------------------
   // Tracing
@@ -115,7 +116,7 @@ declare module 'hook' {
   export function hook_again(): I64
   export function hook_skip(numHooks: I32, name: I32): I64
   export function hook_param(outBuf: WriteBuf, keyBuf: ReadBuf): I64
-  export function hook_param_set(outBuf: WriteBuf, valBuf: ReadBuf, keyBuf: ReadBuf): I64
+  export function hook_param_set(valBuf: ReadBuf, keyBuf: ReadBuf, hookHashBuf: ReadBuf): I64
 
   // ---------------------------------------------------------------------------
   // STO (Serialized Transaction Object)
@@ -137,8 +138,8 @@ declare module 'hook' {
     a?: I32, b?: I32, c?: I32, d?: I32, e?: I32, f?: I32
   ): I64
   export function util_sha512h(outBuf: WriteBuf, inputBuf: ReadBuf): I64
-  export function util_accid(outBuf: WriteBuf, raddr: string): I64
-  export function util_raddr(outBuf: WriteBuf, accidBuf: ReadBuf): I64
+  export function util_accid(outBuf: WriteBuf, accidBuf: ReadBuf): I64
+  export function util_raddr(outBuf: WriteBuf, raddr: string): I64
   export function util_verify(sigBuf: ReadBuf, dataBuf: ReadBuf, pubkeyBuf: ReadBuf): I64
 
   // ---------------------------------------------------------------------------
