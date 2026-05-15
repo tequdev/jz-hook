@@ -10,7 +10,7 @@
 
 import { typed, asF64, asI64, asI32, NULL_NAN, UNDEF_NAN, temp, tempI32, allocPtr, multiCount, arrayLoop, elemLoad, elemStore, truthyIR, extractF64Bits, appendStaticSlots, mkPtrIR, slotAddr, isLiteralStr, resolveValType, undefExpr } from '../src/ir.js'
 import { emit, materializeMulti } from '../src/emit.js'
-import { valTypeOf, lookupValType, lookupNotString, VAL, extractParams, updateRep, staticPropertyKey } from '../src/analyze.js'
+import { valTypeOf, lookupValType, lookupNotString, VAL, extractParams, updateRep, staticPropertyKey, nonNegIntLiteral } from '../src/analyze.js'
 import { ctx, inc, err, PTR, LAYOUT } from '../src/ctx.js'
 import { strHashLiteral } from './collection.js'
 
@@ -251,6 +251,22 @@ export default (ctx) => {
   }
 
   ctx.core.emit['new.Array'] = (len) => {
+    // Hook mode: constant-size new Array(n) → pre-allocate in data section (no runtime allocator).
+    // Layout: [len:i32 LE][cap:i32 LE][constN * 8 zero bytes]; ptr = base+8.
+    if (ctx.transform.host === 'hook' && len != null) {
+      const constN = nonNegIntLiteral(len)
+      if (constN != null) {
+        if (!ctx.runtime.data) ctx.runtime.data = ''
+        const data = ctx.runtime.data
+        const base = (data.length + 7) & ~7  // 8-byte align for f64 elements
+        const le32 = n => String.fromCharCode(n & 0xFF, (n>>8) & 0xFF, (n>>16) & 0xFF, (n>>24) & 0xFF)
+        ctx.runtime.data = data + '\x00'.repeat(base - data.length) + le32(constN) + le32(constN) + '\x00'.repeat(constN * 8)
+        const ptr = base + 8
+        // PTR.ARRAY=1: 0x7FF8000000000000 | (1 << 47) = 0x7FF8800000000000
+        const nanBox = 0x7FF8800000000000n | BigInt(ptr)
+        return typed(['i64.const', '0x' + nanBox.toString(16).toUpperCase().padStart(16, '0')], 'i64')
+      }
+    }
     const n = tempI32('alen')
     const nIR = ['local.get', `$${n}`]
     // L3/'speed' bumps the cap floor to skip the first growth cycles (default 0

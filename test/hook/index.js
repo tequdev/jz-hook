@@ -21,6 +21,7 @@ const TESTS = [
   'validate-wasm',
   'e2e',
   'idiom-map',
+  'array-static',
 ]
 
 const argFilters = process.argv.slice(2)
