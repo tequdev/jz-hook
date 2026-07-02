@@ -1,0 +1,25 @@
+name: guard-checker
+on: [push, pull_request]
+
+jobs:
+  guard-checker:
+    strategy:
+      fail-fast: false
+      matrix:
+        wasm-files:
+          - samples/hook-accept.wasm
+          - samples/hook-firewall.wasm
+          - samples/hook-state-counter.wasm
+          - samples/hook-xfl.wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          mise_toml: |
+            [tools]
+            "github:tequdev/guard-checker" = "latest"
+
+      - name: Check sample hooks
+        run: |
+          guard-checker ${{ matrix.wasm-files }}         
