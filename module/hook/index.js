@@ -11,6 +11,7 @@ import setupOtxn from './otxn.js'
 import setupSlot from './slot.js'
 import setupUtil from './util.js'
 import setupKeylets from './keylets.js'
+import setupConstants from './constants.js'
 
 export default (ctx) => {
   if (ctx.transform?.host !== 'hook') return
@@ -23,4 +24,5 @@ export default (ctx) => {
   setupSlot(ctx)
   setupUtil(ctx)
   setupKeylets(ctx)
+  setupConstants(ctx)
 }

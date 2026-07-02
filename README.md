@@ -50,8 +50,6 @@ jz-hook --validate hook.js -o hook.wasm
 | Option | Description |
 |--------|-------------|
 | `--host hook` | Compile for Xahau Hook (Guard-type v0) |
-<!-- | `--hook-on <hex>` | `sfHookOn` bitmask (default: all enabled) | -->
-<!-- | `--namespace <hex>` | `sfHookNamespace` (32-byte hex) | -->
 | `--max-iter <n>` | Default loop guard iteration cap (default: 65535) |
 | `--validate` | Verify output WASM meets Hook constraints |
 | `-O<n>`, `--optimize <n>` | Optimization level or alias (`size`, `balanced`, `speed`) |

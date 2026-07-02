@@ -59,9 +59,6 @@ Options:
   --validate                Run hook-validate pass after compile (hook host only)
   --version, -v             Show version number
   `)
-  // --hook-on <hex>           sfHookOn bitmask as BigInt hex (default: 0xFFFFFFFFFFFFFFFF, hook host only)
-  // --namespace <hex>         sfHookNamespace 32-byte hex string (hook host only)
-  // --hookapi-version <n>     Hook API version — currently only '0' is valid
 }
 
 async function main() {
@@ -136,7 +133,7 @@ function parseOptimize(v) {
 async function handleCompile(args) {
   let inputFile = null, outputFile = null, wat = false, strict = false, resolveNode = false, importsFile = null
   let optimize, host = 'hook', alloc = true, names = false, abi
-  let hookOn = null, namespace = null, maxIter = null, validate = false, hookapiVersion = null
+  let maxIter = null, validate = false
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
@@ -152,11 +149,8 @@ async function handleCompile(args) {
     else if (a.startsWith('--abi=')) abi = a.slice('--abi='.length)
     else if (a === '--no-alloc') alloc = false
     else if (a === '--names') names = true
-    else if (a === '--hook-on') hookOn = args[++i]
-    else if (a === '--namespace') namespace = args[++i]
     else if (a === '--max-iter') maxIter = parseInt(args[++i], 10)
     else if (a === '--validate') validate = true
-    else if (a === '--hookapi-version') hookapiVersion = args[++i]
     else if (!inputFile) inputFile = a
   }
 
@@ -252,8 +246,6 @@ async function handleCompile(args) {
     opts.imports = JSON.parse(readFileSync(importsPath, 'utf8'))
   }
   if (host) opts.host = host
-  if (hookOn !== null) opts.hookOn = hookOn
-  if (namespace !== null) opts.namespace = namespace
   if (maxIter !== null) opts.maxIter = maxIter
   if (validate) opts.validate = true
 

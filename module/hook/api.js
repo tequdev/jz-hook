@@ -5,6 +5,7 @@
 import { asI64, asI32, typed, temp } from '../../src/ir.js'
 import { inc, ctx, LAYOUT, PTR } from '../../src/ctx.js'
 import { emit } from '../../src/emit.js'
+import { lookupValType, VAL } from '../../src/analyze.js'
 
 export const HOOK_SCRATCH_OFFSET = 512
 export const HOOK_SCRATCH_SIZE = 512
@@ -68,6 +69,7 @@ export default (ctx) => {
   ensureHookImport(ctx, 'otxn_field', ['i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'otxn_type', [])
   ensureHookImport(ctx, 'otxn_burden', [])
+  ensureHookImport(ctx, 'otxn_generation', [])
   ensureHookImport(ctx, 'otxn_slot', ['i32'])
   ensureHookImport(ctx, 'otxn_id', ['i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'otxn_param', ['i32', 'i32', 'i32', 'i32'])
@@ -88,6 +90,7 @@ export default (ctx) => {
 
   // === Hook metadata ===
   ensureHookImport(ctx, 'hook_account', ['i32', 'i32'])
+  ensureHookImport(ctx, 'hook_hash', ['i32', 'i32', 'i32'])
   ensureHookImport(ctx, 'hook_pos', [])
   ensureHookImport(ctx, 'hook_again', [])
   ensureHookImport(ctx, 'hook_skip', ['i32', 'i32'])
@@ -97,6 +100,7 @@ export default (ctx) => {
   // === Ledger ===
   ensureHookImport(ctx, 'ledger_last_time', [])
   ensureHookImport(ctx, 'ledger_seq', [])
+  ensureHookImport(ctx, 'fee_base', [])
   ensureHookImport(ctx, 'ledger_last_hash', ['i32', 'i32'])
   ensureHookImport(ctx, 'ledger_nonce', ['i32', 'i32'])
   ensureHookImport(ctx, 'ledger_keylet', ['i32', 'i32', 'i32', 'i32', 'i32', 'i32', 'i32'])
@@ -317,10 +321,10 @@ export default (ctx) => {
     }
     if (ir[0] === 'local.get' || ir[0] === 'global.get') {
       const varName = typeof ir[1] === 'string' ? ir[1].replace(/^\$/, '') : null
-      const rep = varName
-        ? (ir[0] === 'local.get' ? ctx.func.repByLocal?.get(varName) : ctx.scope.repByGlobal?.get(varName))
-        : null
-      const lenOff = rep?.val === 'string' ? 4 : 8
+      // Strings store their length at ptr-4, buffers (Uint8Array/Array) at ptr-8.
+      // lookupValType resolves both locals (localReps) and module globals
+      // (globalValTypes) — a plain repByLocal/repByGlobal lookup misses globals.
+      const lenOff = varName && lookupValType(varName) === VAL.STRING ? 4 : 8
       return [
         typed(['i32.wrap_i64', ir], 'i32'),
         typed(['i32.load', ['i32.sub', ['i32.wrap_i64', ir], ['i32.const', lenOff]]], 'i32')
@@ -334,8 +338,8 @@ export default (ctx) => {
   }
 
   // === Emitters for zero-arg functions (return i64) ===
-  for (const fn0 of ['otxn_type', 'otxn_burden', 'etxn_burden', 'etxn_generation', 'hook_pos', 'hook_again',
-                     'ledger_last_time', 'ledger_seq', 'float_one']) {
+  for (const fn0 of ['otxn_type', 'otxn_burden', 'otxn_generation', 'etxn_burden', 'etxn_generation', 'hook_pos', 'hook_again',
+                     'ledger_last_time', 'ledger_seq', 'fee_base', 'float_one']) {
     ctx.core.emit[`hook.${fn0}`] = () => typed(['call', `$hook_${fn0}`], 'i64')
   }
 
@@ -412,9 +416,41 @@ export default (ctx) => {
     return typed(['call', '$hook_float_compare', e64(a), e64(b), typed(['i32.const', mode], 'i32')], 'i64')
   }
 
-  for (const fn1 of ['float_negate', 'float_invert', 'float_mantissa', 'float_sign', 'float_exponent']) {
+  for (const fn1 of ['float_negate', 'float_invert', 'float_mantissa', 'float_sign']) {
     ctx.core.emit[`hook.${fn1}`] = (a) => typed(['call', `$hook_${fn1}`, e64(a)], 'i64')
   }
+
+  // float_exponent / float_exponent_set / float_mantissa_set are hookapi.h C macros,
+  // NOT host functions — the official Hooks API exposes no such imports. Lower them to
+  // inline i64 bit ops on the XFL layout (mantissa = bits 0-53, exponent = bits 54-61
+  // biased by 97, sign = bit 62), matching the hookapi.h macro semantics.
+  const XFL_EXP_BIAS = 97
+  const hex64 = (n) => '0x' + BigInt.asUintN(64, n).toString(16).toUpperCase()
+  const XFL_EXP_CLEAR = hex64(~(0xFFn << 54n))      // AND mask clearing the exponent field
+  const XFL_MANT_MASK = hex64((1n << 54n) - 1n)     // low 54 mantissa bits
+  const XFL_MANT_CLEAR = hex64(~((1n << 54n) - 1n)) // AND mask clearing the mantissa field
+
+  // float_exponent(f) → ((f >> 54) & 0xFF) - 97
+  ctx.core.emit['hook.float_exponent'] = (f) =>
+    typed(['i64.sub',
+      ['i64.and', ['i64.shr_u', e64(f), ['i64.const', 54]], ['i64.const', 0xFF]],
+      ['i64.const', XFL_EXP_BIAS]], 'i64')
+
+  // float_exponent_set(f, e) → (f & ~(0xFF<<54)) | (((e + 97) & 0xFF) << 54)
+  ctx.core.emit['hook.float_exponent_set'] = (f, exp) =>
+    typed(['i64.or',
+      ['i64.and', e64(f), ['i64.const', XFL_EXP_CLEAR]],
+      ['i64.shl',
+        ['i64.and',
+          ['i64.add', e64(exp), ['i64.const', XFL_EXP_BIAS]],
+          ['i64.const', 0xFF]],
+        ['i64.const', 54]]], 'i64')
+
+  // float_mantissa_set(f, m) → (f & ~((1<<54)-1)) | (m & ((1<<54)-1))
+  ctx.core.emit['hook.float_mantissa_set'] = (f, mant) =>
+    typed(['i64.or',
+      ['i64.and', e64(f), ['i64.const', XFL_MANT_CLEAR]],
+      ['i64.and', e64(mant), ['i64.const', XFL_MANT_MASK]]], 'i64')
 
   ctx.core.emit['hook.float_int'] = (a, dp, abs) =>
     typed(['call', '$hook_float_int', e64(a),
@@ -423,12 +459,6 @@ export default (ctx) => {
 
   ctx.core.emit['hook.float_set'] = (exp, mant) =>
     typed(['call', '$hook_float_set', e32(exp), e64(mant)], 'i64')
-
-  ctx.core.emit['hook.float_exponent_set'] = (a, exp) =>
-    typed(['call', '$hook_float_exponent_set', e64(a), e32(exp)], 'i64')
-
-  ctx.core.emit['hook.float_mantissa_set'] = (a, mant) =>
-    typed(['call', '$hook_float_mantissa_set', e64(a), e64(mant)], 'i64')
 
   // float_log(f: i64) → i64
   ctx.core.emit['hook.float_log'] = (f) => typed(['call', '$hook_float_log', e64(f)], 'i64')
@@ -510,6 +540,14 @@ export default (ctx) => {
         ['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]], 'i64')
     }
     return typed(['call', '$hook_hook_account', ...hookCapArgs(out)], 'i64')
+  }
+
+  // hook_hash(out_buf?, hook_no?) → i64. out omitted → scratch; hook_no omitted → -1 (self).
+  ctx.core.emit['hook.hook_hash'] = (out, hookNo) => {
+    const buf = out == null
+      ? [['i32.const', HOOK_SCRATCH_OFFSET], ['i32.const', HOOK_SCRATCH_SIZE]]
+      : hookCapArgs(out)
+    return typed(['call', '$hook_hook_hash', ...buf, eopt32(hookNo, ['i32.const', -1])], 'i64')
   }
 
   // hook_skip(nh: i32, name: i32) → i64

@@ -66,6 +66,7 @@ declare module 'hook' {
   export function otxn_id(outBuf: WriteBuf, flags?: I32): I64
   export function otxn_type(): I64
   export function otxn_burden(): I64
+  export function otxn_generation(): I64
 
   // ---------------------------------------------------------------------------
   // Emitted transaction
@@ -105,6 +106,7 @@ declare module 'hook' {
   export function ledger_last_time(): I64
   export function ledger_nonce(outBuf?: WriteBuf): I64
   export function ledger_seq(): I64
+  export function fee_base(): I64
   export function ledger_keylet(outBuf: WriteBuf, keyletType: I32, r1Buf: ReadBuf, r2Buf: ReadBuf): I64
 
   // ---------------------------------------------------------------------------
@@ -112,6 +114,8 @@ declare module 'hook' {
   // ---------------------------------------------------------------------------
 
   export function hook_account(outBuf?: WriteBuf): I64
+  /** Write a Hook's 32-byte hash into outBuf (or scratch). hookNo = -1 (default) is the current Hook. */
+  export function hook_hash(outBuf?: WriteBuf, hookNo?: I32): I64
   export function hook_pos(): I64
   export function hook_again(): I64
   export function hook_skip(numHooks: I32, name: I32): I64
@@ -156,6 +160,12 @@ declare module 'hook' {
   export function float_compare(a: I64, b: I64, mode: 'EQ' | 'NE' | 'LT' | 'GT' | 'LE' | 'GE'): I64
   export function float_mantissa(a: I64): I64
   export function float_sign(a: I64): I64
+  /** Extract the unbiased base-10 exponent of an XFL value (hookapi.h macro, lowered inline). */
+  export function float_exponent(a: I64): I64
+  /** Return a copy of the XFL value with its exponent field replaced (hookapi.h macro, lowered inline). */
+  export function float_exponent_set(a: I64, exponent: I32): I64
+  /** Return a copy of the XFL value with its mantissa field replaced (hookapi.h macro, lowered inline). */
+  export function float_mantissa_set(a: I64, mantissa: I64): I64
   export function float_int(a: I64, decimalPlaces?: I32, absolute?: I32): I64
   export function float_log(f: I64): I64
   export function float_root(f: I64, n: I32): I64
